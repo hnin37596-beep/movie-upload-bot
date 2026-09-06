@@ -1,12 +1,11 @@
 import os
-import asyncio
 import time
-import math
+import asyncio
 from pathlib import Path
 
 import aiohttp
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,69 +14,79 @@ from telegram.ext import (
     filters,
 )
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# =========================================================
+# CONFIG
+# =========================================================
+
+TOKEN = os.getenv("BOT_TOKEN")
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+STATUS_INTERVAL = 2
 
-def format_bytes(num):
-    if num is None:
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def format_bytes(size):
+    if size is None:
         return "Unknown"
 
-    num = float(num)
+    size = float(size)
 
     for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if num < 1024:
-            return f"{num:.1f} {unit}"
-        num /= 1024
+        if size < 1024:
+            return f"{size:.1f} {unit}"
 
-    return f"{num:.1f} PB"
+        size /= 1024
+
+    return f"{size:.1f} PB"
 
 
 def format_time(seconds):
-    if not seconds or seconds < 0 or math.isinf(seconds):
+    if seconds is None or seconds < 0:
         return "--:--"
 
     seconds = int(seconds)
 
-    h, remainder = divmod(seconds, 3600)
-    m, s = divmod(remainder, 60)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
 
-    if h:
-        return f"{h:d}:{m:02d}:{s:02d}"
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-    return f"{m:d}:{s:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def progress_bar(percent, length=12):
     percent = max(0, min(100, percent))
 
     filled = int(length * percent / 100)
-    empty = length - filled
 
-    return "▰" * filled + "▱" * empty
-
-
-def safe_filename(url):
-    name = url.split("?")[0].rstrip("/").split("/")[-1]
-
-    if not name:
-        name = "video"
-
-    # Basic cleanup
-    name = "".join(
-        c for c in name
-        if c.isalnum() or c in "._- "
-    )
-
-    if not name:
-        name = "video"
-
-    return name[:150]
+    return "▰" * filled + "▱" * (length - filled)
 
 
-async def download_file(url, output_path, status_callback):
+def get_filename(url):
+    try:
+        name = url.split("?")[0].rstrip("/").split("/")[-1]
+
+        if not name:
+            name = "video.mp4"
+
+        return name
+
+    except Exception:
+        return "video.mp4"
+
+
+# =========================================================
+# DOWNLOAD
+# =========================================================
+
+async def download_file(url, output_path, status_message):
+
     start_time = time.time()
     downloaded = 0
     last_update = 0
@@ -85,17 +94,27 @@ async def download_file(url, output_path, status_callback):
     timeout = aiohttp.ClientTimeout(
         total=None,
         connect=60,
-        sock_read=120
+        sock_connect=60,
+        sock_read=300,
     )
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=headers
+    ) as session:
 
         async with session.get(
             url,
-            allow_redirects=True,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            }
+            allow_redirects=True
         ) as response:
 
             response.raise_for_status()
@@ -107,14 +126,13 @@ async def download_file(url, output_path, status_callback):
                 async for chunk in response.content.iter_chunked(
                     1024 * 1024
                 ):
-                    file.write(chunk)
 
+                    file.write(chunk)
                     downloaded += len(chunk)
 
                     now = time.time()
 
-                    # Update roughly every 2 seconds
-                    if now - last_update >= 2:
+                    if now - last_update >= STATUS_INTERVAL:
 
                         elapsed = now - start_time
 
@@ -125,128 +143,215 @@ async def download_file(url, output_path, status_callback):
                         )
 
                         if total:
-                            percent = (
-                                downloaded / total
-                            ) * 100
-
-                            remaining = total - downloaded
+                            percent = downloaded / total * 100
 
                             eta = (
-                                remaining / speed
+                                (total - downloaded) / speed
                                 if speed > 0
-                                else 0
+                                else None
                             )
-                        else:
-                            percent = 0
-                            eta = 0
 
-                        await status_callback(
-                            downloaded,
-                            total,
-                            percent,
-                            speed,
-                            eta,
-                            elapsed
-                        )
+                            text = (
+                                "╔══════════════════════════╗\n"
+                                "║   📥 *DOWNLOAD STATUS*   ║\n"
+                                "╚══════════════════════════╝\n\n"
+
+                                "⬇️ *DOWNLOADING*\n\n"
+
+                                f"📁 *File:* `{output_path.name}`\n"
+                                f"{progress_bar(percent)} "
+                                f"*{percent:.1f}%*\n"
+
+                                f"┣ {format_bytes(downloaded)} / "
+                                f"{format_bytes(total)}\n"
+                                f"┣ Speed: {format_bytes(speed)}/s\n"
+                                f"┣ ETA: {format_time(eta)}\n"
+                                f"┗ Elapsed: {format_time(elapsed)}"
+                            )
+
+                        else:
+
+                            text = (
+                                "╔══════════════════════════╗\n"
+                                "║   📥 *DOWNLOAD STATUS*   ║\n"
+                                "╚══════════════════════════╝\n\n"
+
+                                "⬇️ *DOWNLOADING*\n\n"
+
+                                f"📁 *File:* `{output_path.name}`\n"
+                                f"┣ Downloaded: "
+                                f"{format_bytes(downloaded)}\n"
+                                f"┣ Speed: {format_bytes(speed)}/s\n"
+                                f"┗ Elapsed: "
+                                f"{format_time(elapsed)}"
+                            )
+
+                        try:
+                            await status_message.edit_text(
+                                text,
+                                parse_mode="Markdown"
+                            )
+                        except Exception:
+                            pass
 
                         last_update = now
 
+    return downloaded
 
-async def update_download_status(
-    message,
-    downloaded,
-    total,
-    percent,
-    speed,
-    eta,
-    elapsed
+
+# =========================================================
+# UPLOAD
+# =========================================================
+
+async def upload_video(
+    update,
+    status_message,
+    file_path
 ):
-    if total:
-        text = f"""
-╔══════════════════════════╗
-║   📡 DOWNLOAD STATUS     ║
-╚══════════════════════════╝
 
-⬇️ *DOWNLOADING*
+    start_time = time.time()
 
-📁 *File:* {message.chat.id}
+    file_size = file_path.stat().st_size
 
-{progress_bar(percent)} *{percent:.1f}%*
+    await status_message.edit_text(
+        "╔══════════════════════════╗\n"
+        "║   📡 *UPLOAD STATUS*     ║\n"
+        "╚══════════════════════════╝\n\n"
 
-┣ {format_bytes(downloaded)} / {format_bytes(total)}
-┣ Speed: {format_bytes(speed)}/s
-┣ ETA: {format_time(eta)}
-┗ Elapsed: {format_time(elapsed)}
-"""
-    else:
-        text = f"""
-╔══════════════════════════╗
-║   📡 DOWNLOAD STATUS     ║
-╚══════════════════════════╝
+        "⏫ *UPLOADING*\n\n"
 
-⬇️ *DOWNLOADING*
+        f"📁 *File:* `{file_path.name}`\n"
+        f"┣ Size: {format_bytes(file_size)}\n"
+        "┣ Status: Preparing Telegram upload...\n"
+        "┗ Please wait...",
+        parse_mode="Markdown"
+    )
 
-📁 *File:* {message.chat.id}
+    # -----------------------------------------------------
+    # Telegram upload
+    # -----------------------------------------------------
 
-┣ Downloaded: {format_bytes(downloaded)}
-┣ Speed: {format_bytes(speed)}/s
-┗ Elapsed: {format_time(elapsed)}
-"""
+    last_error = None
 
-    try:
-        await message.edit_text(
-            text,
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
+    for attempt in range(1, 4):
 
+        try:
+
+            await update.message.reply_video(
+                video=file_path.open("rb"),
+                caption=(
+                    f"🎬 `{file_path.name}`\n\n"
+                    f"📦 Size: {format_bytes(file_size)}"
+                ),
+                supports_streaming=True,
+                read_timeout=600,
+                write_timeout=600,
+                connect_timeout=120,
+                pool_timeout=120,
+            )
+
+            elapsed = time.time() - start_time
+
+            try:
+                await status_message.edit_text(
+                    "╔══════════════════════════╗\n"
+                    "║   ✅ *UPLOAD COMPLETE*   ║\n"
+                    "╚══════════════════════════╝\n\n"
+
+                    f"🎬 `{file_path.name}`\n"
+                    f"📦 Size: {format_bytes(file_size)}\n"
+                    f"⏱ Time: {format_time(elapsed)}\n\n"
+                    "✅ Video uploaded successfully.",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+            return True
+
+        except Exception as error:
+
+            last_error = error
+
+            try:
+                await status_message.edit_text(
+                    "╔══════════════════════════╗\n"
+                    "║   🔄 *UPLOAD RETRY*      ║\n"
+                    "╚══════════════════════════╝\n\n"
+
+                    f"📁 `{file_path.name}`\n\n"
+                    f"⚠️ Attempt {attempt}/3\n"
+                    f"❗ `{str(error)[:500]}`\n\n"
+                    "🔄 Retrying...",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(5)
+
+    raise last_error
+
+
+# =========================================================
+# START
+# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    text = """
-🎬 *Movie Download Bot*
-
-အသုံးပြုနည်း
-
-1️⃣ Direct video URL ကို ဒီ chat ထဲ ပို့ပါ။
-
-ဥပမာ:
-
-`https://example.com/video.mp4`
-
-2️⃣ Bot က download လုပ်ပါမယ်။
-
-3️⃣ Download ပြီးရင် Telegram ထဲကို video/file ပြန်ပို့ပါမယ်။
-
-⚠️ ကိုယ်ပိုင် သို့မဟုတ် ဖြန့်ဝေခွင့်ရှိတဲ့ content တွေအတွက်သာ အသုံးပြုပါ။
-"""
-
     await update.message.reply_text(
-        text,
+        "🎬 *Movie Download Bot*\n\n"
+
+        "အသုံးပြုနည်း\n\n"
+
+        "1️⃣ Direct video URL ကို ဒီ chat ထဲ ပို့ပါ။\n\n"
+
+        "ဥပမာ:\n"
+        "`https://example.com/video.mp4`\n\n"
+
+        "2️⃣ Bot က download လုပ်ပါမယ်။\n\n"
+
+        "3️⃣ Download ပြီးရင် Telegram ထဲကို video ပြန်ပို့ပါမယ်။\n\n"
+
+        "⚠️ ကိုယ်ပိုင် သို့မဟုတ် ဖြန့်ဝေခွင့်ရှိတဲ့ content တွေအတွက်သာ အသုံးပြုပါ။",
         parse_mode="Markdown"
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# HELP
+# =========================================================
 
-    text = """
-📖 *Commands*
-
-/start - Bot စတင်ရန်
-/help - Help
-
-ပြီးရင် video download URL ကို
-ဒီ chat ထဲ တိုက်ရိုက်ပို့နိုင်ပါတယ်။
-"""
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await update.message.reply_text(
-        text,
+        "📖 *HELP*\n\n"
+
+        "🎬 Direct video URL တစ်ခု ပို့ပါ။\n\n"
+
+        "Bot က:\n"
+        "1️⃣ Download လုပ်မယ်\n"
+        "2️⃣ Download progress ပြမယ်\n"
+        "3️⃣ Telegram ထဲ Upload လုပ်မယ်\n"
+        "4️⃣ ပြီးရင် local file ဖျက်မယ်",
         parse_mode="Markdown"
     )
 
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# URL HANDLER
+# =========================================================
+
+async def handle_url(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message or not update.message.text:
+        return
 
     url = update.message.text.strip()
 
@@ -256,157 +361,179 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ):
         return
 
-    status = await update.message.reply_text(
-        """
-╔══════════════════════════╗
-║   📡 DOWNLOAD STATUS     ║
-╚══════════════════════════╝
+    filename = get_filename(url)
 
-⏳ *Preparing...*
-""",
-        parse_mode="Markdown"
-    )
+    # Remove unsafe filename characters
+    filename = "".join(
+        c for c in filename
+        if c.isalnum()
+        or c in "._-()[] "
+    ).strip()
 
-    filename = safe_filename(url)
-
-    if "." not in filename:
-        filename += ".mp4"
+    if not filename:
+        filename = "video.mp4"
 
     output_path = DOWNLOAD_DIR / filename
 
+    status_message = await update.message.reply_text(
+        "⏳ Preparing download..."
+    )
+
     try:
 
-        async def callback(
-            downloaded,
-            total,
-            percent,
-            speed,
-            eta,
-            elapsed
-        ):
-            await update_download_status(
-                status,
-                downloaded,
-                total,
-                percent,
-                speed,
-                eta,
-                elapsed
-            )
+        # -------------------------------------------------
+        # DOWNLOAD
+        # -------------------------------------------------
 
         await download_file(
             url,
             output_path,
-            callback
+            status_message
         )
 
-        await status.edit_text(
-            """
-╔══════════════════════════╗
-║   📡 DOWNLOAD STATUS     ║
-╚══════════════════════════╝
+        # -------------------------------------------------
+        # DOWNLOAD COMPLETE
+        # -------------------------------------------------
 
-✅ *DOWNLOAD COMPLETE*
+        size = output_path.stat().st_size
 
-⬆️ Preparing Telegram upload...
-""",
+        await status_message.edit_text(
+            "╔══════════════════════════╗\n"
+            "║   ✅ *DOWNLOAD COMPLETE* ║\n"
+            "╚══════════════════════════╝\n\n"
+
+            f"📁 *File:* `{output_path.name}`\n"
+            f"📦 Size: {format_bytes(size)}\n\n"
+
+            "📡 Preparing Telegram upload...",
             parse_mode="Markdown"
         )
 
-        file_size = output_path.stat().st_size
+        # -------------------------------------------------
+        # UPLOAD
+        # -------------------------------------------------
 
-        await update.message.chat.send_action(
-            action=ChatAction.UPLOAD_VIDEO
-        )
-
-        start_upload = time.time()
-
-        with open(output_path, "rb") as video:
-
-            await update.message.reply_video(
-                video=video,
-                caption=(
-                    f"🎬 {filename}\n\n"
-                    f"📦 Size: {format_bytes(file_size)}\n"
-                    f"⏱ Download time: "
-                    f"{format_time(time.time() - start_upload)}"
-                ),
-                supports_streaming=True
-            )
-
-        await status.edit_text(
-            f"""
-╔══════════════════════════╗
-║   📡 UPLOAD STATUS       ║
-╚══════════════════════════╝
-
-✅ *UPLOAD COMPLETE*
-
-📁 File: `{filename}`
-📦 Size: {format_bytes(file_size)}
-
-🎬 Video has been sent successfully.
-""",
-            parse_mode="Markdown"
+        await upload_video(
+            update,
+            status_message,
+            output_path
         )
 
     except Exception as error:
 
-        await status.edit_text(
-            f"""
-❌ *FAILED*
+        error_text = str(error)
 
-Error:
+        try:
+            await status_message.edit_text(
+                "╔══════════════════════════╗\n"
+                "║      ❌ *FAILED*         ║\n"
+                "╚══════════════════════════╝\n\n"
 
-`{str(error)[:1000]}`
-""",
-            parse_mode="Markdown"
-        )
+                "⚠️ *Error:*\n\n"
+                f"`{error_text[:3500]}`",
+                parse_mode="Markdown"
+            )
+
+        except Exception:
+            pass
 
     finally:
 
-        # Delete local file after upload
+        # -------------------------------------------------
+        # DELETE LOCAL FILE
+        # -------------------------------------------------
+
         try:
+
             if output_path.exists():
                 output_path.unlink()
+
         except Exception:
             pass
 
 
+# =========================================================
+# ERROR HANDLER
+# =========================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    print(
+        "BOT ERROR:",
+        repr(context.error)
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
 def main():
 
-    if not BOT_TOKEN:
+    if not TOKEN:
+
         raise RuntimeError(
-            "BOT_TOKEN environment variable is missing."
+            "BOT_TOKEN is missing. "
+            "Please add BOT_TOKEN in GitHub Actions Secrets."
         )
 
-    app = (
+    # -----------------------------------------------------
+    # FIX SSL / HTTPX CONNECTION SETTINGS
+    # -----------------------------------------------------
+
+    request = HTTPXRequest(
+        connection_pool_size=2,
+        connect_timeout=120,
+        read_timeout=600,
+        write_timeout=600,
+        pool_timeout=120,
+        http_version="1.1",
+    )
+
+    application = (
         Application.builder()
-        .token(BOT_TOKEN)
+        .token(TOKEN)
+        .request(request)
         .build()
     )
 
-    app.add_handler(
+    # Commands
+    application.add_handler(
         CommandHandler("start", start)
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler("help", help_command)
     )
 
-    app.add_handler(
+    # URL messages
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             handle_url
         )
     )
 
-    print("Bot is running...")
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    application.add_error_handler(
+        error_handler
     )
 
+    print("================================")
+    print("🎬 Movie Download Bot")
+    print("🤖 Bot is running...")
+    print("================================")
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
     main()
