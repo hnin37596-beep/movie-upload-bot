@@ -9,7 +9,6 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 from telegram import Update
-from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,172 +22,184 @@ from telegram.ext import (
 # CONFIG
 # =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+CHUNK_SIZE = 1024 * 1024  # 1 MB
 STATUS_INTERVAL = 2
 
 
 # =========================================================
-# USER AGENT
+# HELPERS
 # =========================================================
 
-USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 14) "
-    "AppleWebKit/537.36 "
-    "(KHTML, like Gecko) "
-    "Chrome/128.0.0.0 Mobile Safari/537.36"
-)
-
-
-# =========================================================
-# FORMAT HELPERS
-# =========================================================
-
-def format_bytes(size):
-
+def format_bytes(size: int) -> str:
     if size is None:
         return "Unknown"
 
     size = float(size)
 
-    units = [
-        "B",
-        "KB",
-        "MB",
-        "GB",
-        "TB",
-    ]
+    units = ["B", "KB", "MB", "GB", "TB"]
 
     for unit in units:
-
         if size < 1024:
             return f"{size:.1f} {unit}"
-
         size /= 1024
 
     return f"{size:.1f} PB"
 
 
-def format_time(seconds):
-
-    if seconds is None:
-        return "--:--"
-
-    if seconds < 0:
+def format_time(seconds: float) -> str:
+    if not seconds or seconds < 0:
         return "--:--"
 
     seconds = int(seconds)
 
-    hours, remainder = divmod(
-        seconds,
-        3600
-    )
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
 
-    minutes, secs = divmod(
-        remainder,
-        60
-    )
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
-    if hours > 0:
-
-        return (
-            f"{hours:02d}:"
-            f"{minutes:02d}:"
-            f"{secs:02d}"
-        )
-
-    return (
-        f"{minutes:02d}:"
-        f"{secs:02d}"
-    )
+    return f"{m:02d}:{s:02d}"
 
 
-def progress_bar(percent, length=12):
+def progress_bar(percent: float, length: int = 20) -> str:
+    percent = max(0, min(100, percent))
 
-    percent = max(
-        0,
-        min(
-            100,
-            percent
+    filled = int(length * percent / 100)
+
+    return "▰" * filled + "▱" * (length - filled)
+
+
+def is_http_url(text: str) -> bool:
+    return bool(
+        re.match(
+            r"^https?://",
+            text.strip(),
+            re.IGNORECASE,
         )
     )
 
-    filled = int(
-        length * percent / 100
-    )
+
+def is_mediafire_url(url: str) -> bool:
+    url = url.lower()
 
     return (
-        "▰" * filled
-        +
-        "▱" * (length - filled)
+        "mediafire.com/file/" in url
+        or "www.mediafire.com/file/" in url
+        or "mfi.re/" in url
     )
 
 
-def safe_filename(filename):
+# =========================================================
+# FILENAME
+# =========================================================
 
-    filename = unquote(filename)
+def filename_from_headers(headers) -> str | None:
 
-    filename = filename.replace(
-        "\x00",
-        ""
+    content_disposition = headers.get(
+        "Content-Disposition",
+        "",
     )
 
-    filename = re.sub(
-        r'[<>:"/\\|?*]',
+    if not content_disposition:
+        return None
+
+    # filename*=UTF-8''
+    match = re.search(
+        r"filename\*\s*=\s*(?:UTF-8'')?([^;]+)",
+        content_disposition,
+        re.IGNORECASE,
+    )
+
+    if match:
+        name = unquote(match.group(1).strip('"'))
+
+        if name:
+            return name
+
+    # filename="..."
+    match = re.search(
+        r'filename\s*=\s*"([^"]+)"',
+        content_disposition,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return match.group(1)
+
+    # filename=...
+    match = re.search(
+        r"filename\s*=\s*([^;]+)",
+        content_disposition,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return match.group(1).strip().strip('"')
+
+    return None
+
+
+def filename_from_url(url: str) -> str:
+
+    clean_url = url.split("?", 1)[0]
+
+    name = clean_url.rstrip("/").split("/")[-1]
+
+    name = unquote(name)
+
+    if not name:
+        return "download.bin"
+
+    return name
+
+
+def safe_filename(name: str) -> str:
+
+    name = unquote(name)
+
+    name = re.sub(
+        r'[<>:"/\\|?*\x00-\x1F]',
         "_",
-        filename
+        name,
     )
 
-    filename = filename.strip(
-        " ."
-    )
+    name = name.strip()
 
-    if not filename:
+    if not name:
+        return "download.bin"
 
-        filename = "download.bin"
-
-    return filename
+    return name[:200]
 
 
 # =========================================================
-# MEDIAFIRE DETECTION
-# =========================================================
-
-def is_mediafire_url(url):
-
-    url_lower = url.lower()
-
-    return (
-        "mediafire.com/file/" in url_lower
-        or "www.mediafire.com/file/" in url_lower
-        or "mfi.re/" in url_lower
-    )
-
-
-# =========================================================
-# MEDIAFIRE DIRECT URL RESOLVER
+# MEDIAFIRE RESOLVER
 # =========================================================
 
 async def resolve_mediafire_url(
-    session,
-    mediafire_url
+    session: aiohttp.ClientSession,
+    mediafire_url: str,
 ):
 
+    print("MediaFire URL detected")
+
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        ),
         "Accept": (
-            "text/html,"
-            "application/xhtml+xml,"
-            "application/xml;q=0.9,"
-            "*/*;q=0.8"
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,*/*;q=0.8"
         ),
-        "Accept-Language": (
-            "en-US,en;q=0.9"
-        ),
-        "Referer": "https://www.google.com/",
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
     async with session.get(
@@ -197,83 +208,87 @@ async def resolve_mediafire_url(
         allow_redirects=True,
         timeout=aiohttp.ClientTimeout(
             total=120
-        )
+        ),
     ) as response:
 
-        response.raise_for_status()
+        final_page_url = str(response.url)
 
-        final_page_url = str(
-            response.url
+        print(
+            "MediaFire page:",
+            final_page_url,
         )
+
+        if response.status != 200:
+            raise RuntimeError(
+                f"MediaFire page HTTP {response.status}"
+            )
 
         html = await response.text(
             errors="ignore"
         )
 
-    # -----------------------------------------------------
-    # METHOD 1
-    # BeautifulSoup downloadButton
-    # -----------------------------------------------------
-
     soup = BeautifulSoup(
         html,
-        "html.parser"
+        "html.parser",
     )
 
-    download_button = soup.find(
-        id="downloadButton"
+    candidates = []
+
+    # -----------------------------------------------------
+    # 1. Official download button
+    # -----------------------------------------------------
+
+    download_button = soup.select_one(
+        "#downloadButton"
     )
 
     if download_button:
 
-        href = download_button.get(
-            "href"
-        )
+        href = download_button.get("href")
 
         if href:
-
-            href = href.strip()
-
-            href = href.replace(
-                "&amp;",
-                "&"
+            candidates.append(
+                urljoin(
+                    final_page_url,
+                    href,
+                )
             )
-
-            href = href.replace(
-                "\\/",
-                "/"
-            )
-
-            direct_url = urljoin(
-                final_page_url,
-                href
-            )
-
-            if (
-                "mediafire.com"
-                in direct_url.lower()
-                or
-                "download"
-                in direct_url.lower()
-            ):
-
-                return direct_url
 
     # -----------------------------------------------------
-    # METHOD 2
-    # Find download*.mediafire.com URL
+    # 2. Links containing download
+    # -----------------------------------------------------
+
+    for tag in soup.find_all("a"):
+
+        href = tag.get("href")
+
+        if not href:
+            continue
+
+        href = urljoin(
+            final_page_url,
+            href,
+        )
+
+        low = href.lower()
+
+        if (
+            "download" in low
+            or "mediafire.com" in low
+        ):
+            candidates.append(href)
+
+    # -----------------------------------------------------
+    # 3. Search HTML for direct MediaFire URL
     # -----------------------------------------------------
 
     patterns = [
 
-        r'https?://download\d+\.mediafire\.com/[^\s"\'<>]+',
+        r'https?://download\d*\.mediafire\.com/[^\s"\']+',
 
-        r'https?:\\?/\\?/download\d+\.mediafire\.com\\?/[^"\']+',
+        r'https?://download\d*\.mediafire\.com/[^\s"\'<>]+',
 
-        r'"downloadUrl"\s*:\s*"([^"]+)"',
-
-        r'"download_url"\s*:\s*"([^"]+)"',
-
+        r'https?:\\?/\\?/download\d*\.mediafire\.com\\?/[^"\']+',
     ]
 
     for pattern in patterns:
@@ -281,873 +296,789 @@ async def resolve_mediafire_url(
         matches = re.findall(
             pattern,
             html,
-            re.IGNORECASE
+            re.IGNORECASE,
         )
 
         for match in matches:
 
-            direct_url = match
-
-            direct_url = direct_url.replace(
-                "\\/",
-                "/"
+            match = (
+                match
+                .replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("&amp;", "&")
             )
 
-            direct_url = direct_url.replace(
-                "&amp;",
-                "&"
-            )
-
-            direct_url = direct_url.strip(
-                "\"'"
-            )
-
-            if direct_url.startswith(
-                "//"
-            ):
-
-                direct_url = (
-                    "https:"
-                    +
-                    direct_url
-                )
-
-            if (
-                "download"
-                in direct_url.lower()
-            ):
-
-                return direct_url
+            candidates.append(match)
 
     # -----------------------------------------------------
-    # METHOD 3
-    # Search all href links
+    # 4. Search JS / HTML around download URL
     # -----------------------------------------------------
 
-    for tag in soup.find_all(
-        "a",
-        href=True
-    ):
+    direct_candidates = []
 
-        href = tag.get(
-            "href"
-        )
+    for candidate in candidates:
 
-        if not href:
-            continue
-
-        href = href.strip()
-
-        href = href.replace(
-            "&amp;",
-            "&"
-        )
-
-        href = href.replace(
-            "\\/",
-            "/"
-        )
-
-        full_url = urljoin(
-            final_page_url,
-            href
+        candidate = (
+            candidate
+            .replace("&amp;", "&")
+            .strip()
+            .strip('"')
+            .strip("'")
         )
 
         if (
-            "download"
-            in full_url.lower()
-            and
-            (
-                "mediafire"
-                in full_url.lower()
-            )
+            candidate.startswith("http://")
+            or candidate.startswith("https://")
         ):
+            direct_candidates.append(
+                candidate
+            )
 
-            return full_url
+    # Remove duplicates
+    unique = []
+
+    for url in direct_candidates:
+
+        if url not in unique:
+            unique.append(url)
+
+    if not unique:
+
+        raise RuntimeError(
+            "MediaFire direct download link မတွေ့ပါ။ "
+            "MediaFire page က direct URL ကို မထုတ်ပေးနိုင်သေးပါ။"
+        )
+
+    print(
+        f"MediaFire candidates: {len(unique)}"
+    )
 
     # -----------------------------------------------------
-    # Failed
+    # Test candidate URLs
     # -----------------------------------------------------
 
-    raise RuntimeError(
-        "MediaFire ရဲ့ actual download link "
-        "ကိုရှာမတွေ့ပါ။ "
-        "File က private / deleted ဖြစ်နိုင်ပါတယ် "
-        "သို့မဟုတ် MediaFire page structure ပြောင်းထားနိုင်ပါတယ်။"
+    for candidate in unique:
+
+        try:
+
+            test_headers = {
+                "User-Agent": headers["User-Agent"],
+                "Accept": "*/*",
+                "Referer": final_page_url,
+            }
+
+            async with session.get(
+                candidate,
+                headers=test_headers,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(
+                    total=60
+                ),
+            ) as test_response:
+
+                content_type = (
+                    test_response.headers.get(
+                        "Content-Type",
+                        ""
+                    ).lower()
+                )
+
+                final_url = str(
+                    test_response.url
+                )
+
+                content_length = (
+                    test_response.headers.get(
+                        "Content-Length"
+                    )
+                )
+
+                print(
+                    "Candidate:",
+                    candidate[:120]
+                )
+
+                print(
+                    "Final:",
+                    final_url[:120]
+                )
+
+                print(
+                    "Content-Type:",
+                    content_type
+                )
+
+                print(
+                    "Content-Length:",
+                    content_length
+                )
+
+                # Real downloadable response
+                if (
+                    content_type.startswith("video/")
+                    or "application/octet-stream"
+                    in content_type
+                    or "binary/octet-stream"
+                    in content_type
+                ):
+                    return (
+                        final_url,
+                        final_page_url,
+                    )
+
+        except Exception as e:
+
+            print(
+                "Candidate test error:",
+                repr(e)
+            )
+
+    # If direct content type could not be confirmed,
+    # return first candidate and let download validator decide.
+    return (
+        unique[0],
+        final_page_url,
     )
 
 
 # =========================================================
-# GET FILENAME FROM RESPONSE
+# VIDEO VALIDATION
 # =========================================================
 
-def filename_from_headers(
-    headers
-):
+def looks_like_html(first_bytes: bytes) -> bool:
 
-    content_disposition = headers.get(
-        "Content-Disposition",
-        ""
+    data = first_bytes.lstrip().lower()
+
+    return (
+        data.startswith(b"<html")
+        or data.startswith(b"<!doctype")
+        or data.startswith(b"<head")
+        or data.startswith(b"<body")
+        or data.startswith(b"<script")
     )
 
-    if content_disposition:
 
-        match = re.search(
-            r"filename\*=UTF-8''([^;]+)",
-            content_disposition,
-            re.IGNORECASE
-        )
+def looks_like_mp4(first_bytes: bytes) -> bool:
 
-        if match:
+    # MP4/MOV normally contains "ftyp"
+    # inside the first MP4 box.
 
-            return safe_filename(
-                match.group(1)
-            )
+    if len(first_bytes) >= 12:
 
-        match = re.search(
-            r'filename="?([^";]+)"?',
-            content_disposition,
-            re.IGNORECASE
-        )
+        if first_bytes[4:8] == b"ftyp":
+            return True
 
-        if match:
+    # Sometimes ftyp is not exactly at offset 4.
+    if b"ftyp" in first_bytes[:64]:
+        return True
 
-            return safe_filename(
-                match.group(1)
-            )
-
-    return None
+    return False
 
 
-# =========================================================
-# GET FILENAME FROM URL
-# =========================================================
+def looks_like_video(
+    first_bytes: bytes,
+    content_type: str,
+    filename: str,
+) -> bool:
 
-def filename_from_url(url):
+    content_type = (
+        content_type or ""
+    ).lower()
 
-    try:
+    filename = (
+        filename or ""
+    ).lower()
 
-        clean_url = (
-            url.split("?")[0]
-            .rstrip("/")
-        )
+    if content_type.startswith("video/"):
+        return True
 
-        name = clean_url.split(
-            "/"
-        )[-1]
+    if looks_like_mp4(first_bytes):
+        return True
 
-        name = unquote(
-            name
-        )
+    video_extensions = (
+        ".mp4",
+        ".mkv",
+        ".webm",
+        ".avi",
+        ".mov",
+        ".m4v",
+        ".ts",
+        ".mpeg",
+        ".mpg",
+    )
 
-        if name:
+    if filename.endswith(
+        video_extensions
+    ):
+        # Filename alone is NOT enough.
+        # We only accept if it's not HTML.
+        if not looks_like_html(first_bytes):
+            return True
 
-            return safe_filename(
-                name
-            )
-
-    except Exception:
-
-        pass
-
-    return "video.mp4"
+    return False
 
 
 # =========================================================
-# DOWNLOAD FILE
+# DOWNLOAD
 # =========================================================
 
 async def download_file(
-    url,
-    output_path,
-    status_message,
-    referer=None
+    session: aiohttp.ClientSession,
+    url: str,
+    save_path: Path,
+    progress_message=None,
 ):
 
-    start_time = time.time()
-
-    downloaded = 0
-
-    last_update = 0
-
     headers = {
-
-        "User-Agent": USER_AGENT,
-
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        ),
         "Accept": "*/*",
-
     }
 
-    if referer:
+    started = time.monotonic()
 
-        headers[
-            "Referer"
-        ] = referer
-
-    timeout = aiohttp.ClientTimeout(
-
-        total=None,
-
-        connect=120,
-
-        sock_connect=120,
-
-        sock_read=600,
-
-    )
-
-    connector = aiohttp.TCPConnector(
-
-        limit=4,
-
-        limit_per_host=2,
-
-        ssl=True,
-
-        enable_cleanup_closed=True,
-
-    )
-
-    async with aiohttp.ClientSession(
-
-        timeout=timeout,
-
-        connector=connector,
-
+    async with session.get(
+        url,
         headers=headers,
+        allow_redirects=True,
+        timeout=aiohttp.ClientTimeout(
+            total=None,
+            sock_connect=60,
+            sock_read=300,
+        ),
+    ) as response:
 
-    ) as session:
+        final_url = str(response.url)
 
-        async with session.get(
+        status = response.status
 
-            url,
+        content_type = (
+            response.headers.get(
+                "Content-Type",
+                "",
+            ).lower()
+        )
 
-            allow_redirects=True,
+        content_length_header = (
+            response.headers.get(
+                "Content-Length"
+            )
+        )
 
-        ) as response:
+        try:
 
-            response.raise_for_status()
+            total_size = int(
+                content_length_header
+            ) if content_length_header else 0
 
-            total = response.content_length
+        except ValueError:
 
-            # ---------------------------------------------
-            # Get filename from actual response
-            # ---------------------------------------------
+            total_size = 0
 
-            server_filename = (
-                filename_from_headers(
-                    response.headers
-                )
+        print("HTTP Status:", status)
+        print("Final URL:", final_url)
+        print("Content-Type:", content_type)
+        print("Content-Length:", total_size)
+
+        if status != 200:
+
+            raise RuntimeError(
+                f"Download HTTP Error: {status}"
             )
 
-            if server_filename:
+        # -------------------------------------------------
+        # Read first chunk for validation
+        # -------------------------------------------------
 
-                output_path = (
-                    output_path.parent
-                    /
-                    server_filename
+        first_chunk = await response.content.read(
+            CHUNK_SIZE
+        )
+
+        if not first_chunk:
+
+            raise RuntimeError(
+                "Server က empty response ပြန်ပေးပါတယ်။"
+            )
+
+        # HTML response protection
+        if looks_like_html(first_chunk):
+
+            raise RuntimeError(
+                "Video အစား HTML page ရရှိနေပါတယ်။ "
+                "Direct download link မမှန်ပါ။"
+            )
+
+        # -------------------------------------------------
+        # Filename
+        # -------------------------------------------------
+
+        filename = filename_from_headers(
+            response.headers
+        )
+
+        if not filename:
+
+            filename = filename_from_url(
+                final_url
+            )
+
+        filename = safe_filename(
+            filename
+        )
+
+        # -------------------------------------------------
+        # Validate video
+        # -------------------------------------------------
+
+        if not looks_like_video(
+            first_chunk,
+            content_type,
+            filename,
+        ):
+
+            preview = first_chunk[:32]
+
+            raise RuntimeError(
+                "Downloaded file က video file မဟုတ်ပါ။\n"
+                f"Content-Type: {content_type or 'Unknown'}\n"
+                f"First bytes: {preview!r}\n"
+                f"Final URL: {final_url}"
+            )
+
+        # -------------------------------------------------
+        # Save
+        # -------------------------------------------------
+
+        actual_path = (
+            save_path.parent / filename
+        )
+
+        downloaded = 0
+
+        with open(
+            actual_path,
+            "wb",
+        ) as file:
+
+            # Write first validated chunk
+            file.write(first_chunk)
+
+            downloaded += len(first_chunk)
+
+            last_status = 0
+
+            while True:
+
+                chunk = await response.content.read(
+                    CHUNK_SIZE
                 )
 
-            # ---------------------------------------------
-            # Download
-            # ---------------------------------------------
+                if not chunk:
+                    break
 
-            with open(
-                output_path,
-                "wb"
-            ) as file:
+                file.write(chunk)
 
-                async for chunk in response.content.iter_chunked(
-                    1024 * 1024
+                downloaded += len(chunk)
+
+                now = time.monotonic()
+
+                if (
+                    progress_message
+                    and now - last_status
+                    >= STATUS_INTERVAL
                 ):
 
-                    file.write(
-                        chunk
+                    last_status = now
+
+                    elapsed = (
+                        now - started
                     )
 
-                    downloaded += len(
-                        chunk
+                    speed = (
+                        downloaded / elapsed
+                        if elapsed > 0
+                        else 0
                     )
 
-                    now = time.time()
+                    if total_size:
 
-                    if (
-                        now - last_update
-                        >= STATUS_INTERVAL
-                    ):
-
-                        elapsed = (
-                            now
-                            -
-                            start_time
+                        percent = (
+                            downloaded
+                            / total_size
+                            * 100
                         )
 
-                        speed = (
-                            downloaded
-                            /
-                            elapsed
-                            if elapsed > 0
+                        remaining = (
+                            total_size
+                            - downloaded
+                        )
+
+                        eta = (
+                            remaining / speed
+                            if speed > 0
                             else 0
                         )
 
-                        if total:
+                        text = (
+                            "╔══════════════════════════╗\n"
+                            "║   📥 *DOWNLOAD STATUS*   ║\n"
+                            "╚══════════════════════════╝\n\n"
+                            "⬇️ *DOWNLOADING*\n\n"
+                            f"📁 *File:* `{filename}`\n"
+                            f"{progress_bar(percent)} "
+                            f"*{percent:.1f}%*\n"
+                            f"┣ {format_bytes(downloaded)} / "
+                            f"{format_bytes(total_size)}\n"
+                            f"┣ Speed: "
+                            f"{format_bytes(speed)}/s\n"
+                            f"┣ ETA: "
+                            f"{format_time(eta)}\n"
+                            f"┗ Elapsed: "
+                            f"{format_time(elapsed)}"
+                        )
 
-                            percent = (
-                                downloaded
-                                /
-                                total
-                                *
-                                100
-                            )
+                    else:
 
-                            if speed > 0:
+                        text = (
+                            "╔══════════════════════════╗\n"
+                            "║   📥 *DOWNLOAD STATUS*   ║\n"
+                            "╚══════════════════════════╝\n\n"
+                            "⬇️ *DOWNLOADING*\n\n"
+                            f"📁 *File:* `{filename}`\n"
+                            f"┣ Downloaded: "
+                            f"{format_bytes(downloaded)}\n"
+                            f"┣ Speed: "
+                            f"{format_bytes(speed)}/s\n"
+                            f"┗ Elapsed: "
+                            f"{format_time(elapsed)}"
+                        )
 
-                                eta = (
-                                    total
-                                    -
-                                    downloaded
-                                ) / speed
+                    try:
 
-                            else:
+                        await progress_message.edit_text(
+                            text,
+                            parse_mode="Markdown",
+                        )
 
-                                eta = None
+                    except Exception:
+                        pass
 
-                            text = (
+        final_size = (
+            actual_path.stat().st_size
+        )
 
-                                "╔══════════════════════════╗\n"
-                                "║   📥 *DOWNLOAD STATUS*   ║\n"
-                                "╚══════════════════════════╝\n\n"
+        # Final validation
+        if final_size == 0:
 
-                                "⬇️ *DOWNLOADING*\n\n"
-
-                                f"📁 *File:* `{output_path.name}`\n"
-
-                                f"{progress_bar(percent)} "
-                                f"*{percent:.1f}%*\n"
-
-                                f"┣ {format_bytes(downloaded)} / "
-                                f"{format_bytes(total)}\n"
-
-                                f"┣ Speed: "
-                                f"{format_bytes(speed)}/s\n"
-
-                                f"┣ ETA: "
-                                f"{format_time(eta)}\n"
-
-                                f"┗ Elapsed: "
-                                f"{format_time(elapsed)}"
-
-                            )
-
-                        else:
-
-                            text = (
-
-                                "╔══════════════════════════╗\n"
-                                "║   📥 *DOWNLOAD STATUS*   ║\n"
-                                "╚══════════════════════════╝\n\n"
-
-                                "⬇️ *DOWNLOADING*\n\n"
-
-                                f"📁 *File:* `{output_path.name}`\n"
-
-                                f"┣ Downloaded: "
-                                f"{format_bytes(downloaded)}\n"
-
-                                f"┣ Speed: "
-                                f"{format_bytes(speed)}/s\n"
-
-                                f"┗ Elapsed: "
-                                f"{format_time(elapsed)}"
-
-                            )
-
-                        try:
-
-                            await status_message.edit_text(
-
-                                text,
-
-                                parse_mode="Markdown"
-
-                            )
-
-                        except Exception:
-
-                            pass
-
-                        last_update = now
-
-            return (
-                output_path,
-                downloaded
+            actual_path.unlink(
+                missing_ok=True
             )
+
+            raise RuntimeError(
+                "Downloaded file size = 0"
+            )
+
+        elapsed = (
+            time.monotonic() - started
+        )
+
+        return (
+            actual_path,
+            final_size,
+            elapsed,
+            final_url,
+        )
 
 
 # =========================================================
-# START
+# /START
 # =========================================================
 
 async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    text = (
+        "╔══════════════════════════╗\n"
+        "║   🎬 *MOVIE UPLOAD BOT*  ║\n"
+        "╚══════════════════════════╝\n\n"
+        "🔗 Video URL ပို့ပါ။\n\n"
+        "✅ Direct MP4\n"
+        "✅ Direct Video URL\n"
+        "✅ MediaFire URL\n\n"
+        "📥 Bot က video ကို download လုပ်ပေးပါမယ်။"
+    )
+
     await update.message.reply_text(
-
-        "🎬 *Movie Download Bot*\n\n"
-
-        "အသုံးပြုနည်း\n\n"
-
-        "1️⃣ Direct MP4 URL ပို့နိုင်ပါတယ်။\n\n"
-
-        "2️⃣ MediaFire link ပို့နိုင်ပါတယ်။\n\n"
-
-        "ဥပမာ:\n"
-
-        "`https://www.mediafire.com/file/xxxxx/file`\n\n"
-
-        "Bot က MediaFire direct download URL "
-        "ကိုရှာပြီး download လုပ်ပါမယ်။\n\n"
-
-        "⚠️ ကိုယ်ပိုင် သို့မဟုတ် "
-        "ဖြန့်ဝေခွင့်ရှိတဲ့ content တွေအတွက်သာ "
-        "အသုံးပြုပါ။",
-
-        parse_mode="Markdown"
-
+        text,
+        parse_mode="Markdown",
     )
 
 
 # =========================================================
-# HELP
+# /HELP
 # =========================================================
 
 async def help_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    await update.message.reply_text(
-
+    text = (
         "📖 *HELP*\n\n"
+        "Bot ထဲကို video URL တစ်ခု ပို့ပါ။\n\n"
+        "ဥပမာ:\n"
+        "`https://example.com/movie.mp4`\n\n"
+        "MediaFire:\n"
+        "`https://www.mediafire.com/file/...`\n\n"
+        "📌 Direct video URL ဖြစ်ရင် တိုက်ရိုက် download လုပ်ပါမယ်။\n"
+        "📌 MediaFire ဖြစ်ရင် direct download URL ရှာပါမယ်။"
+    )
 
-        "Bot သို့ URL ပို့ပါ။\n\n"
-
-        "✅ Direct MP4\n"
-        "✅ MediaFire file link\n\n"
-
-        "MediaFire link ဖြစ်ရင်\n"
-
-        "1️⃣ Download page ကိုဖွင့်မယ်\n"
-        "2️⃣ Direct download URL ရှာမယ်\n"
-        "3️⃣ File ကို download လုပ်မယ်\n"
-        "4️⃣ Download progress ပြမယ်\n\n"
-
-        "⚠️ Authorized content only.",
-
-        parse_mode="Markdown"
-
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
     )
 
 
 # =========================================================
-# URL HANDLER
+# HANDLE URL
 # =========================================================
 
 async def handle_url(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     if not update.message:
-
         return
 
-    if not update.message.text:
+    text = (
+        update.message.text or ""
+    ).strip()
 
-        return
+    if not is_http_url(text):
 
-    original_url = (
-        update.message.text.strip()
-    )
-
-    # ---------------------------------------------
-    # Check URL
-    # ---------------------------------------------
-
-    if not (
-
-        original_url.startswith(
-            "http://"
+        await update.message.reply_text(
+            "❌ HTTP/HTTPS URL ပို့ပါ။"
         )
 
-        or
-
-        original_url.startswith(
-            "https://"
-        )
-
-    ):
-
         return
 
-    status_message = await update.message.reply_text(
-
-        "⏳ *Preparing...*",
-
-        parse_mode="Markdown"
-
+    status = await update.message.reply_text(
+        "╔══════════════════════════╗\n"
+        "║   🔎 *CHECKING URL*      ║\n"
+        "╚══════════════════════════╝\n\n"
+        "⏳ URL ကိုစစ်ဆေးနေပါတယ်...",
+        parse_mode="Markdown",
     )
 
-    output_path = None
+    # -----------------------------------------------------
+    # HTTP session
+    # -----------------------------------------------------
 
-    try:
+    cookie_jar = aiohttp.CookieJar(
+        unsafe=True
+    )
 
-        # =================================================
-        # MEDIAFIRE
-        # =================================================
+    timeout = aiohttp.ClientTimeout(
+        total=None,
+        sock_connect=60,
+        sock_read=300,
+    )
 
-        if is_mediafire_url(
-            original_url
-        ):
+    connector = aiohttp.TCPConnector(
+        limit=4,
+        ttl_dns_cache=300,
+    )
 
-            await status_message.edit_text(
+    async with aiohttp.ClientSession(
+        connector=connector,
+        cookie_jar=cookie_jar,
+        timeout=timeout,
+    ) as session:
 
-                "╔══════════════════════════╗\n"
-                "║   🔎 *MEDIAFIRE*         ║\n"
-                "╚══════════════════════════╝\n\n"
+        try:
 
-                "🔗 MediaFire download page ကိုဖတ်နေပါတယ်...\n\n"
-                "⏳ Direct download link ရှာနေပါတယ်...",
+            download_url = text
+            referer = None
 
-                parse_mode="Markdown"
+            # -------------------------------------------------
+            # MediaFire
+            # -------------------------------------------------
 
-            )
+            if is_mediafire_url(text):
 
-            timeout = aiohttp.ClientTimeout(
-
-                total=120,
-
-                connect=60,
-
-                sock_connect=60,
-
-                sock_read=120,
-
-            )
-
-            connector = aiohttp.TCPConnector(
-
-                limit=4,
-
-                limit_per_host=2,
-
-                ssl=True,
-
-            )
-
-            async with aiohttp.ClientSession(
-
-                timeout=timeout,
-
-                connector=connector,
-
-            ) as session:
-
-                direct_url = (
-                    await resolve_mediafire_url(
-                        session,
-                        original_url
-                    )
+                await status.edit_text(
+                    "╔══════════════════════════╗\n"
+                    "║   🔍 *MEDIAFIRE*         ║\n"
+                    "╚══════════════════════════╝\n\n"
+                    "⏳ Direct download link ရှာနေပါတယ်...",
+                    parse_mode="Markdown",
                 )
 
-            # ---------------------------------------------
-            # Direct URL found
-            # ---------------------------------------------
-
-            await status_message.edit_text(
-
-                "╔══════════════════════════╗\n"
-                "║   ✅ *LINK FOUND*        ║\n"
-                "╚══════════════════════════╝\n\n"
-
-                "🔗 MediaFire direct download link ရပါပြီ။\n\n"
-
-                "⬇️ Download စတင်နေပါတယ်...",
-
-                parse_mode="Markdown"
-
-            )
-
-            # Use generic filename first
-            filename = (
-                filename_from_url(
-                    direct_url
+                (
+                    download_url,
+                    referer,
+                ) = await resolve_mediafire_url(
+                    session,
+                    text,
                 )
-            )
 
-            # If extension isn't useful
-            if (
-                "." not in filename
-                or
-                len(filename) < 3
-            ):
-
-                filename = "mediafire_download.mp4"
-
-            output_path = (
-                DOWNLOAD_DIR
-                /
-                filename
-            )
-
-            # ---------------------------------------------
+            # -------------------------------------------------
             # Download
-            # ---------------------------------------------
+            # -------------------------------------------------
 
-            output_path, downloaded = (
-                await download_file(
-
-                    direct_url,
-
-                    output_path,
-
-                    status_message,
-
-                    referer=(
-                        original_url
-                    ),
-
-                )
-            )
-
-        # =================================================
-        # DIRECT URL
-        # =================================================
-
-        else:
-
-            filename = (
-                filename_from_url(
-                    original_url
-                )
-            )
-
-            output_path = (
-                DOWNLOAD_DIR
-                /
-                filename
-            )
-
-            await status_message.edit_text(
-
-                "⬇️ *Direct file download စတင်နေပါတယ်...*",
-
-                parse_mode="Markdown"
-
-            )
-
-            output_path, downloaded = (
-                await download_file(
-
-                    original_url,
-
-                    output_path,
-
-                    status_message,
-
-                )
-            )
-
-        # =================================================
-        # DOWNLOAD COMPLETE
-        # =================================================
-
-        if not output_path.exists():
-
-            raise RuntimeError(
-                "Download ပြီးသွားတယ်လို့ပြပေမယ့် "
-                "local file မတွေ့ပါ။"
-            )
-
-        file_size = (
-            output_path.stat().st_size
-        )
-
-        if file_size <= 0:
-
-            raise RuntimeError(
-                "Downloaded file size က 0 bytes ဖြစ်နေပါတယ်။"
-            )
-
-        elapsed = time.time()
-
-        await status_message.edit_text(
-
-            "╔══════════════════════════╗\n"
-            "║   ✅ *DOWNLOAD COMPLETE* ║\n"
-            "╚══════════════════════════╝\n\n"
-
-            f"📁 *File:* `{output_path.name}`\n"
-
-            f"📦 *Size:* "
-            f"{format_bytes(file_size)}\n\n"
-
-            "✅ File ကို server ထဲ successfully download လုပ်ပြီးပါပြီ။\n\n"
-
-            "📡 Telegram upload ကို စမ်းသပ်နေပါတယ်...",
-
-            parse_mode="Markdown"
-
-        )
-
-        # =================================================
-        # TELEGRAM UPLOAD
-        # =================================================
-        #
-        # NOTE:
-        # Telegram Bot API နဲ့ large files upload လုပ်ရာမှာ
-        # platform/API size limits ရှိနိုင်ပါတယ်။
-        #
-        # Upload မအောင်မြင်ရင် downloaded file ကို
-        # မဖျက်ပါဘူး။
-        # =================================================
-
-        try:
-
-            with open(
-                output_path,
-                "rb"
-            ) as video_file:
-
-                await update.message.reply_document(
-
-                    document=video_file,
-
-                    filename=output_path.name,
-
-                    caption=(
-                        f"🎬 `{output_path.name}`\n\n"
-                        f"📦 {format_bytes(file_size)}"
-                    ),
-
-                    read_timeout=600,
-
-                    write_timeout=600,
-
-                    connect_timeout=120,
-
-                    pool_timeout=120,
-
-                )
-
-            await status_message.edit_text(
-
+            await status.edit_text(
                 "╔══════════════════════════╗\n"
-                "║   ✅ *ALL DONE*          ║\n"
+                "║   📥 *DOWNLOAD START*    ║\n"
                 "╚══════════════════════════╝\n\n"
-
-                f"📁 `{output_path.name}`\n"
-
-                f"📦 {format_bytes(file_size)}\n\n"
-
-                "✅ Download\n"
-                "✅ Telegram Upload",
-
-                parse_mode="Markdown"
-
+                "⏳ Video download စတင်နေပါတယ်...",
+                parse_mode="Markdown",
             )
 
-            # Upload successful → delete local file
+            # Temporary name.
+            # Real filename will be determined from
+            # Content-Disposition / final URL.
+            temp_path = (
+                DOWNLOAD_DIR / "download.tmp"
+            )
 
-            try:
+            (
+                file_path,
+                file_size,
+                elapsed,
+                final_url,
+            ) = await download_file(
+                session,
+                download_url,
+                temp_path,
+                status,
+            )
 
-                output_path.unlink()
+            # -------------------------------------------------
+            # Download completed
+            # -------------------------------------------------
 
-            except Exception:
+            speed = (
+                file_size / elapsed
+                if elapsed > 0
+                else 0
+            )
 
-                pass
-
-        except Exception as upload_error:
-
-            # ---------------------------------------------
-            # IMPORTANT:
-            # Do NOT delete downloaded file
-            # ---------------------------------------------
-
-            await status_message.edit_text(
-
+            await status.edit_text(
                 "╔══════════════════════════╗\n"
-                "║   ⚠️ *DOWNLOAD OK*       ║\n"
+                "║   ✅ *DOWNLOAD OK*       ║\n"
                 "╚══════════════════════════╝\n\n"
+                f"📁 *File:* `{file_path.name}`\n"
+                f"📦 *Size:* {format_bytes(file_size)}\n"
+                f"⚡ *Avg Speed:* "
+                f"{format_bytes(speed)}/s\n"
+                f"⏱ *Time:* "
+                f"{format_time(elapsed)}\n\n"
+                "📤 *Telegram Upload* ကို နောက်တစ်ဆင့်မှာ ချိတ်ပါမယ်။",
+                parse_mode="Markdown",
+            )
 
-                f"📁 *File:* `{output_path.name}`\n"
+            # -------------------------------------------------
+            # CURRENT STEP:
+            # Telegram Cloud Bot API cannot upload >50MB.
+            # Keep file for the next upload engine.
+            # -------------------------------------------------
 
-                f"📦 *Size:* "
-                f"{format_bytes(file_size)}\n\n"
+            if file_size > 50 * 1024 * 1024:
 
-                "✅ Download ပြီးပါပြီ။\n"
+                await update.message.reply_text(
+                    "⚠️ *Download ပြီးပါပြီ*\n\n"
+                    f"📁 `{file_path.name}`\n"
+                    f"📦 {format_bytes(file_size)}\n\n"
+                    "📌 File က 50 MB ထက်ကြီးပါတယ်။\n"
+                    "Telegram Cloud Bot API နဲ့ တိုက်ရိုက် upload မလုပ်နိုင်ပါ။\n\n"
+                    "🚀 *Large File Upload Engine* ကို "
+                    "နောက်အဆင့်မှာ ချိတ်ရပါမယ်။",
+                    parse_mode="Markdown",
+                )
 
-                "❌ Telegram Upload မအောင်မြင်ပါ။\n\n"
+            else:
 
+                # Small files can still use normal Bot API.
+                await status.edit_text(
+                    "╔══════════════════════════╗\n"
+                    "║   📤 *UPLOADING*         ║\n"
+                    "╚══════════════════════════╝\n\n"
+                    "⏳ Telegram သို့ upload လုပ်နေပါတယ်...",
+                    parse_mode="Markdown",
+                )
+
+                try:
+
+                    with open(
+                        file_path,
+                        "rb",
+                    ) as video_file:
+
+                        await update.message.reply_document(
+                            document=video_file,
+                            filename=file_path.name,
+                            read_timeout=300,
+                            write_timeout=300,
+                            connect_timeout=60,
+                            pool_timeout=60,
+                        )
+
+                    await status.edit_text(
+                        "╔══════════════════════════╗\n"
+                        "║   ✅ *ALL DONE*          ║\n"
+                        "╚══════════════════════════╝\n\n"
+                        f"📁 `{file_path.name}`\n"
+                        f"📦 {format_bytes(file_size)}\n\n"
+                        "✅ Download\n"
+                        "✅ Telegram Upload",
+                        parse_mode="Markdown",
+                    )
+
+                    file_path.unlink(
+                        missing_ok=True
+                    )
+
+                except Exception as upload_error:
+
+                    await status.edit_text(
+                        "╔══════════════════════════╗\n"
+                        "║   ⚠️ *DOWNLOAD OK*       ║\n"
+                        "╚══════════════════════════╝\n\n"
+                        f"📁 `{file_path.name}`\n"
+                        f"📦 {format_bytes(file_size)}\n\n"
+                        "❌ Telegram Upload မအောင်မြင်ပါ။\n\n"
+                        f"Error:\n"
+                        f"`{type(upload_error).__name__}: "
+                        f"{upload_error}`\n\n"
+                        "💾 Downloaded file ကို runner ပေါ်မှာ "
+                        "လက်ရှိ run ပြီးဆုံးတဲ့အထိ မဖျက်ထားပါ။",
+                        parse_mode="Markdown",
+                    )
+
+        except Exception as error:
+
+            print(
+                "ERROR:",
+                repr(error)
+            )
+
+            await status.edit_text(
+                "╔══════════════════════════╗\n"
+                "║   ❌ *FAILED*            ║\n"
+                "╚══════════════════════════╝\n\n"
                 f"Error:\n"
-                f"`{str(upload_error)[:2500]}`\n\n"
-
-                "💾 Downloaded file ကို server မှာ "
-                "မဖျက်ထားပါ။",
-
-                parse_mode="Markdown"
-
+                f"`{type(error).__name__}: "
+                f"{error}`",
+                parse_mode="Markdown",
             )
-
-    # =====================================================
-    # MAIN ERROR
-    # =====================================================
-
-    except Exception as error:
-
-        error_text = str(
-            error
-        )
-
-        try:
-
-            await status_message.edit_text(
-
-                "╔══════════════════════════╗\n"
-                "║      ❌ *FAILED*         ║\n"
-                "╚══════════════════════════╝\n\n"
-
-                f"⚠️ *Error:*\n\n"
-                f"`{error_text[:3500]}`",
-
-                parse_mode="Markdown"
-
-            )
-
-        except Exception:
-
-            pass
-
-        # ---------------------------------------------
-        # Only delete incomplete file
-        # ---------------------------------------------
-
-        if output_path:
-
-            try:
-
-                if output_path.exists():
-
-                    # If download failed,
-                    # remove incomplete file
-
-                    output_path.unlink()
-
-            except Exception:
-
-                pass
 
 
 # =========================================================
@@ -1155,15 +1086,13 @@ async def handle_url(
 # =========================================================
 
 async def error_handler(
-    update,
-    context: ContextTypes.DEFAULT_TYPE
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
 
     print(
         "BOT ERROR:",
-        repr(
-            context.error
-        )
+        repr(context.error)
     )
 
 
@@ -1173,128 +1102,51 @@ async def error_handler(
 
 def main():
 
-    if not TOKEN:
+    if not BOT_TOKEN:
 
         raise RuntimeError(
-
-            "BOT_TOKEN မတွေ့ပါ။\n"
-            "GitHub Repository → Settings → "
-            "Secrets and variables → Actions → "
-            "BOT_TOKEN ထည့်ထားကြောင်း စစ်ပါ။"
-
+            "BOT_TOKEN GitHub Secret မတွေ့ပါ။"
         )
-
-    # -----------------------------------------------------
-    # HTTPX / Telegram connection
-    # -----------------------------------------------------
-
-    request = HTTPXRequest(
-
-        connection_pool_size=2,
-
-        connect_timeout=120,
-
-        read_timeout=600,
-
-        write_timeout=600,
-
-        pool_timeout=120,
-
-        http_version="1.1",
-
-    )
 
     application = (
-
         Application.builder()
-
-        .token(TOKEN)
-
-        .request(request)
-
+        .token(BOT_TOKEN)
         .build()
-
     )
 
-    # -----------------------------------------------------
-    # COMMANDS
-    # -----------------------------------------------------
-
     application.add_handler(
-
         CommandHandler(
             "start",
-            start
+            start,
         )
-
     )
 
     application.add_handler(
-
         CommandHandler(
             "help",
-            help_command
+            help_command,
         )
-
     )
-
-    # -----------------------------------------------------
-    # URL HANDLER
-    # -----------------------------------------------------
 
     application.add_handler(
-
         MessageHandler(
-
-            filters.TEXT
-            &
-            ~filters.COMMAND,
-
-            handle_url
-
+            filters.TEXT & ~filters.COMMAND,
+            handle_url,
         )
-
     )
-
-    # -----------------------------------------------------
-    # ERROR HANDLER
-    # -----------------------------------------------------
 
     application.add_error_handler(
         error_handler
     )
 
     print(
-        "======================================"
-    )
-
-    print(
-        "🎬 Movie Download Bot"
-    )
-
-    print(
-        "🤖 Bot is running..."
-    )
-
-    print(
-        "📥 Direct URL + MediaFire supported"
-    )
-
-    print(
-        "======================================"
+        "Movie Upload Bot started..."
     )
 
     application.run_polling(
-
         drop_pending_updates=True
-
     )
 
 
-# =========================================================
-# RUN
-# =========================================================
-
 if __name__ == "__main__":
-
     main()
