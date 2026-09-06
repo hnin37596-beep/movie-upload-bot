@@ -37,13 +37,20 @@ jobs:
           python -m pip install "aiohttp>=3.10"
           python -m pip install "httpx>=0.27"
           python -m pip install "beautifulsoup4>=4.12"
+          python -m pip install "telethon>=1.43,<2"
 
       - name: Check BeautifulSoup
         run: |
           python -c "from bs4 import BeautifulSoup; print('BeautifulSoup OK')"
 
+      - name: Check Telethon
+        run: |
+          python -c "import telethon; print('Telethon OK:', telethon.__version__)"
+
       - name: Start Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
         run: |
           python bot.py
