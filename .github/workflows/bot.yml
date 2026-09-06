@@ -17,11 +17,21 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Check FFmpeg
+        run: |
+          ffmpeg -version
+          ffprobe -version
+
       - name: Upgrade pip
         run: |
           python -m pip install --upgrade pip
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install "python-telegram-bot>=22,<23"
           python -m pip install "aiohttp>=3.10"
