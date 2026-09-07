@@ -6,6 +6,7 @@ import asyncio
 import shutil
 from pathlib import Path
 from urllib.parse import urlparse, unquote
+from dataclasses import dataclass
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -53,21 +54,26 @@ CONVERT_DIR.mkdir(exist_ok=True)
 
 STATUS_INTERVAL = 2
 
-# Telegram MTProto parallel upload workers
-UPLOAD_WORKERS = 8
+# ============================================================
+# UPLOAD SPEED
+# ============================================================
 
-# Telegram recommended max part size
+UPLOAD_WORKERS = 12
+
+# Telegram recommended maximum part size
 PART_SIZE = 512 * 1024
 
-# Bot API limit
+# Bot API cloud upload limit
 BOT_API_LIMIT = 50 * 1024 * 1024
 
 
 # ============================================================
-# TELETHON CLIENT
+# TELETHON
 # ============================================================
 
-SESSION_PATH = str(DOWNLOAD_DIR / "movie_bot_mtproto")
+SESSION_PATH = str(
+    DOWNLOAD_DIR / "movie_bot_mtproto"
+)
 
 telethon_client = TelegramClient(
     SESSION_PATH,
@@ -77,18 +83,53 @@ telethon_client = TelegramClient(
 
 
 # ============================================================
+# QUEUE
+# ============================================================
+
+@dataclass
+class QueueItem:
+
+    video_url: str
+    thumbnail_url: str | None
+    chat_id: int
+    user_id: int
+    number: int = 0
+
+
+queue = asyncio.Queue()
+
+queue_items = []
+
+queue_lock = asyncio.Lock()
+
+queue_worker_task = None
+
+current_item = None
+
+current_cancel_event = None
+
+
+# ============================================================
 # BASIC HELPERS
 # ============================================================
 
 def format_bytes(value):
+
     if value is None:
         return "0 B"
 
     value = float(value)
 
-    units = ["B", "KB", "MB", "GB", "TB"]
+    units = [
+        "B",
+        "KB",
+        "MB",
+        "GB",
+        "TB",
+    ]
 
     for unit in units:
+
         if value < 1024:
             return f"{value:.2f} {unit}"
 
@@ -98,36 +139,63 @@ def format_bytes(value):
 
 
 def format_time(seconds):
+
     if not seconds or seconds < 0:
         return "--:--"
 
     seconds = int(seconds)
 
     h = seconds // 3600
+
     m = (seconds % 3600) // 60
+
     s = seconds % 60
 
     if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
+        return (
+            f"{h:02d}:"
+            f"{m:02d}:"
+            f"{s:02d}"
+        )
 
-    return f"{m:02d}:{s:02d}"
+    return (
+        f"{m:02d}:"
+        f"{s:02d}"
+    )
 
 
-def progress_bar(percent, length=20):
-    percent = max(0, min(100, percent))
+def progress_bar(
+    percent,
+    length=20,
+):
 
-    filled = int(length * percent / 100)
+    percent = max(
+        0,
+        min(100, percent),
+    )
 
-    return "█" * filled + "░" * (length - filled)
+    filled = int(
+        length * percent / 100
+    )
+
+    return (
+        "█" * filled
+        + "░" * (length - filled)
+    )
 
 
 def safe_filename(name):
+
     if not name:
         name = "video"
 
     name = unquote(name)
 
-    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+    name = re.sub(
+        r'[\\/:*?"<>|]+',
+        "_",
+        name,
+    )
 
     name = name.strip()
 
@@ -138,24 +206,42 @@ def safe_filename(name):
 
 
 def is_http_url(url):
+
     if not url:
         return False
 
     try:
+
         p = urlparse(url)
 
-        return p.scheme.lower() in ("http", "https")
+        return p.scheme.lower() in (
+            "http",
+            "https",
+        )
 
     except Exception:
+
         return False
 
 
 def is_mediafire_url(url):
-    return "mediafire.com" in url.lower()
+
+    return (
+        "mediafire.com"
+        in url.lower()
+    )
 
 
-def get_filename_from_headers(headers):
-    content_disposition = headers.get("Content-Disposition", "")
+def get_filename_from_headers(
+    headers,
+):
+
+    content_disposition = (
+        headers.get(
+            "Content-Disposition",
+            "",
+        )
+    )
 
     match = re.search(
         r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';]+)',
@@ -164,39 +250,55 @@ def get_filename_from_headers(headers):
     )
 
     if match:
-        return safe_filename(match.group(1))
+
+        return safe_filename(
+            match.group(1)
+        )
 
     return None
 
 
 def get_filename_from_url(url):
+
     try:
+
         path = urlparse(url).path
 
-        name = Path(unquote(path)).name
+        name = Path(
+            unquote(path)
+        ).name
 
         if name:
-            return safe_filename(name)
+
+            return safe_filename(
+                name
+            )
 
     except Exception:
+
         pass
 
     return None
 
 
 # ============================================================
-# MEDIAFIRE RESOLVER
+# MEDIAFIRE
 # ============================================================
 
 async def resolve_mediafire(url):
+
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "Chrome/131.0 Safari/537.36"
         )
     }
 
-    timeout = aiohttp.ClientTimeout(total=120)
+    timeout = aiohttp.ClientTimeout(
+        total=120
+    )
 
     async with aiohttp.ClientSession(
         timeout=timeout,
@@ -208,34 +310,55 @@ async def resolve_mediafire(url):
             allow_redirects=True,
         ) as response:
 
-            html = await response.text(errors="ignore")
+            response.raise_for_status()
 
-    soup = BeautifulSoup(html, "html.parser")
+            html = await response.text(
+                errors="ignore"
+            )
 
-    # MediaFire download button
-    button = soup.select_one("#downloadButton")
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
+
+    button = soup.select_one(
+        "#downloadButton"
+    )
 
     if button:
-        href = button.get("href")
 
-        if href and is_http_url(href):
+        href = button.get(
+            "href"
+        )
+
+        if (
+            href
+            and is_http_url(href)
+        ):
+
             return href
 
-    # Search anchors
-    for a in soup.find_all("a", href=True):
+    for a in soup.find_all(
+        "a",
+        href=True,
+    ):
 
         href = a["href"]
 
-        text = a.get_text(" ", strip=True).lower()
+        text = a.get_text(
+            " ",
+            strip=True,
+        ).lower()
 
         if (
             "download" in text
             or "download" in href.lower()
         ):
+
             if is_http_url(href):
+
                 return href
 
-    # Regex fallback
     patterns = [
         r'https?://[^"\']+download[^"\']+',
         r'https?://[^"\']+mediafireusercontent[^"\']+',
@@ -250,7 +373,531 @@ async def resolve_mediafire(url):
         )
 
         if match:
-            return match.group(0).replace("&amp;", "&")
+
+            return (
+                match.group(0)
+                .replace(
+                    "&amp;",
+                    "&",
+                )
+            )
+
+    return None
+
+
+# ============================================================
+# PARSE MULTIPLE LINKS
+# ============================================================
+
+def parse_multiple_requests(
+    text,
+):
+    """
+    Supported:
+
+    Video: https://site/a.mp4
+    Thumbnail: https://site/a.jpg
+
+    Video: https://site/b.mp4
+    Thumbnail: https://site/b.jpg
+
+    Also supports:
+
+    https://site/a.mp4
+    https://site/b.mp4
+    """
+
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    items = []
+
+    current_video = None
+    current_thumb = None
+
+    for line in lines:
+
+        video_match = re.match(
+            r"^Video\s*:\s*(https?://\S+)",
+            line,
+            re.I,
+        )
+
+        thumb_match = re.match(
+            r"^Thumbnail\s*:\s*(https?://\S+)",
+            line,
+            re.I,
+        )
+
+        if video_match:
+
+            # Save previous item
+            if current_video:
+
+                items.append(
+                    (
+                        current_video,
+                        current_thumb,
+                    )
+                )
+
+            current_video = (
+                video_match.group(1)
+                .strip()
+            )
+
+            current_thumb = None
+
+            continue
+
+        if thumb_match:
+
+            if current_video:
+
+                current_thumb = (
+                    thumb_match.group(1)
+                    .strip()
+                )
+
+            continue
+
+        # Plain URL
+        urls = re.findall(
+            r'https?://\S+',
+            line,
+            re.I,
+        )
+
+        for url in urls:
+
+            url = url.strip()
+
+            if not is_http_url(url):
+                continue
+
+            # If a Video is waiting,
+            # save it first.
+            if current_video:
+
+                items.append(
+                    (
+                        current_video,
+                        current_thumb,
+                    )
+                )
+
+                current_video = None
+                current_thumb = None
+
+            items.append(
+                (
+                    url,
+                    None,
+                )
+            )
+
+    if current_video:
+
+        items.append(
+            (
+                current_video,
+                current_thumb,
+            )
+        )
+
+    return items
+
+
+# ============================================================
+# FFMPEG
+# ============================================================
+
+def ffmpeg_available():
+
+    return (
+        shutil.which("ffmpeg")
+        is not None
+    )
+
+
+def ffprobe_available():
+
+    return (
+        shutil.which("ffprobe")
+        is not None
+    )
+
+
+async def probe_video(path):
+
+    if not ffprobe_available():
+
+        return {
+            "width": 0,
+            "height": 0,
+            "duration": 0,
+        }
+
+    process = (
+        await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=0",
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    )
+
+    stdout, stderr = (
+        await process.communicate()
+    )
+
+    text = stdout.decode(
+        "utf-8",
+        errors="ignore",
+    )
+
+    width = 0
+    height = 0
+    duration = 0
+
+    for line in text.splitlines():
+
+        if line.startswith(
+            "width="
+        ):
+
+            try:
+                width = int(
+                    line.split(
+                        "=",
+                        1,
+                    )[1]
+                )
+            except Exception:
+                pass
+
+        elif line.startswith(
+            "height="
+        ):
+
+            try:
+                height = int(
+                    line.split(
+                        "=",
+                        1,
+                    )[1]
+                )
+            except Exception:
+                pass
+
+        elif line.startswith(
+            "duration="
+        ):
+
+            try:
+                duration = float(
+                    line.split(
+                        "=",
+                        1,
+                    )[1]
+                )
+            except Exception:
+                pass
+
+    return {
+        "width": width,
+        "height": height,
+        "duration": duration,
+    }
+
+
+async def convert_to_mp4(
+    input_path,
+    output_path,
+    status_message=None,
+    cancel_event=None,
+):
+
+    if not ffmpeg_available():
+
+        raise RuntimeError(
+            "FFmpeg is not installed."
+        )
+
+    if status_message:
+
+        try:
+
+            await status_message.edit_text(
+                "🔄 <b>Preparing MP4...</b>",
+                parse_mode="HTML",
+            )
+
+        except Exception:
+            pass
+
+    process = (
+        await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    )
+
+    stdout, stderr = (
+        await process.communicate()
+    )
+
+    if process.returncode == 0:
+
+        return output_path
+
+    if output_path.exists():
+
+        try:
+            output_path.unlink()
+        except Exception:
+            pass
+
+    if cancel_event and cancel_event.is_set():
+
+        raise asyncio.CancelledError()
+
+    if status_message:
+
+        try:
+
+            await status_message.edit_text(
+                "🎞️ <b>Converting to MP4...</b>\n\n"
+                "Please wait...",
+                parse_mode="HTML",
+            )
+
+        except Exception:
+            pass
+
+    process = (
+        await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    )
+
+    stdout, stderr = (
+        await process.communicate()
+    )
+
+    if process.returncode != 0:
+
+        error = stderr.decode(
+            "utf-8",
+            errors="ignore",
+        )
+
+        raise RuntimeError(
+            "FFmpeg conversion failed:\n"
+            + error[-3000:]
+        )
+
+    return output_path
+
+
+# ============================================================
+# THUMBNAIL
+# ============================================================
+
+async def normalize_thumbnail(
+    input_path,
+    output_path,
+):
+
+    if not ffmpeg_available():
+
+        shutil.copy2(
+            input_path,
+            output_path,
+        )
+
+        return output_path
+
+    process = (
+        await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-vf",
+            (
+                "scale=320:320:"
+                "force_original_aspect_ratio=decrease"
+            ),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "5",
+            str(output_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    )
+
+    stdout, stderr = (
+        await process.communicate()
+    )
+
+    if process.returncode != 0:
+
+        shutil.copy2(
+            input_path,
+            output_path,
+        )
+
+    return output_path
+
+
+async def download_thumbnail(
+    url,
+    output_path,
+):
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "Chrome/131.0 Safari/537.36"
+        )
+    }
+
+    timeout = aiohttp.ClientTimeout(
+        total=120
+    )
+
+    raw_path = output_path.with_suffix(
+        ".raw"
+    )
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=headers,
+    ) as session:
+
+        async with session.get(
+            url,
+            allow_redirects=True,
+        ) as response:
+
+            response.raise_for_status()
+
+            with open(
+                raw_path,
+                "wb",
+            ) as f:
+
+                async for chunk in response.content.iter_chunked(
+                    256 * 1024
+                ):
+
+                    f.write(chunk)
+
+    try:
+
+        await normalize_thumbnail(
+            raw_path,
+            output_path,
+        )
+
+    finally:
+
+        try:
+            raw_path.unlink()
+        except Exception:
+            pass
+
+    return output_path
+
+
+async def extract_thumbnail(
+    video_path,
+    output_path,
+):
+
+    if not ffmpeg_available():
+
+        return None
+
+    process = (
+        await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-ss",
+            "00:00:03",
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-vf",
+            (
+                "scale=320:320:"
+                "force_original_aspect_ratio=decrease"
+            ),
+            "-q:v",
+            "5",
+            str(output_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    )
+
+    stdout, stderr = (
+        await process.communicate()
+    )
+
+    if process.returncode != 0:
+
+        return None
+
+    if output_path.exists():
+
+        return output_path
 
     return None
 
@@ -263,11 +910,15 @@ async def download_file(
     url,
     output_path,
     status_message=None,
+    cancel_event=None,
 ):
+
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "Chrome/131.0 Safari/537.36"
         ),
         "Accept": "*/*",
     }
@@ -302,44 +953,70 @@ async def download_file(
                 )
             )
 
-            header_name = get_filename_from_headers(
-                response.headers
+            header_name = (
+                get_filename_from_headers(
+                    response.headers
+                )
             )
 
-            with open(output_path, "wb") as f:
+            with open(
+                output_path,
+                "wb",
+            ) as f:
 
                 async for chunk in response.content.iter_chunked(
                     1024 * 1024
                 ):
+
+                    if (
+                        cancel_event
+                        and cancel_event.is_set()
+                    ):
+
+                        raise asyncio.CancelledError()
 
                     if not chunk:
                         continue
 
                     f.write(chunk)
 
-                    downloaded += len(chunk)
+                    downloaded += len(
+                        chunk
+                    )
 
                     now = time.monotonic()
 
                     if (
                         status_message
-                        and now - last_update >= STATUS_INTERVAL
+                        and now - last_update
+                        >= STATUS_INTERVAL
                     ):
-                        elapsed = now - start_time
+
+                        elapsed = (
+                            now - start_time
+                        )
 
                         speed = (
-                            downloaded / elapsed
+                            downloaded
+                            / elapsed
                             if elapsed > 0
                             else 0
                         )
 
                         if total > 0:
+
                             percent = (
-                                downloaded / total * 100
+                                downloaded
+                                / total
+                                * 100
                             )
 
                             remaining = (
-                                (total - downloaded) / speed
+                                (
+                                    total
+                                    - downloaded
+                                )
+                                / speed
                                 if speed > 0
                                 else 0
                             )
@@ -352,21 +1029,27 @@ async def download_file(
                                 f"{format_bytes(total)}\n"
                                 f"⚡ {format_bytes(speed)}/s\n"
                                 f"⏱ {format_time(elapsed)}\n"
-                                f"🕐 ETA {format_time(remaining)}"
+                                f"🕐 ETA "
+                                f"{format_time(remaining)}"
                             )
 
                         else:
+
                             text = (
                                 "⬇️ <b>Downloading...</b>\n\n"
-                                f"📦 {format_bytes(downloaded)}\n"
-                                f"⚡ {format_bytes(speed)}/s"
+                                f"📦 "
+                                f"{format_bytes(downloaded)}\n"
+                                f"⚡ "
+                                f"{format_bytes(speed)}/s"
                             )
 
                         try:
+
                             await status_message.edit_text(
                                 text,
                                 parse_mode="HTML",
                             )
+
                         except Exception:
                             pass
 
@@ -375,347 +1058,33 @@ async def download_file(
     return {
         "size": downloaded,
         "header_filename": header_name,
-        "final_url": str(response.url),
     }
 
 
 # ============================================================
-# VIDEO VALIDATION
+# MP4 CHECK
 # ============================================================
 
 def is_valid_mp4(path):
+
     try:
-        with open(path, "rb") as f:
+
+        with open(
+            path,
+            "rb",
+        ) as f:
 
             header = f.read(4096)
 
-        if b"ftyp" in header:
-            return True
+        return b"ftyp" in header
 
     except Exception:
-        pass
 
-    return False
-
-
-# ============================================================
-# FFMPEG
-# ============================================================
-
-def ffmpeg_available():
-    return shutil.which("ffmpeg") is not None
-
-
-def ffprobe_available():
-    return shutil.which("ffprobe") is not None
-
-
-async def probe_video(path):
-    if not ffprobe_available():
-        return {
-            "width": 0,
-            "height": 0,
-            "duration": 0,
-        }
-
-    process = await asyncio.create_subprocess_exec(
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=width,height",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=0",
-        str(path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    stdout, stderr = await process.communicate()
-
-    text = stdout.decode(
-        "utf-8",
-        errors="ignore",
-    )
-
-    width = 0
-    height = 0
-    duration = 0
-
-    for line in text.splitlines():
-
-        if line.startswith("width="):
-            try:
-                width = int(line.split("=", 1)[1])
-            except Exception:
-                pass
-
-        elif line.startswith("height="):
-            try:
-                height = int(line.split("=", 1)[1])
-            except Exception:
-                pass
-
-        elif line.startswith("duration="):
-            try:
-                duration = float(
-                    line.split("=", 1)[1]
-                )
-            except Exception:
-                pass
-
-    return {
-        "width": width,
-        "height": height,
-        "duration": duration,
-    }
-
-
-async def convert_to_mp4(
-    input_path,
-    output_path,
-    status_message=None,
-):
-    if not ffmpeg_available():
-        raise RuntimeError(
-            "FFmpeg is not installed."
-        )
-
-    if status_message:
-        try:
-            await status_message.edit_text(
-                "🔄 <b>Preparing MP4...</b>",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    # --------------------------------------------------------
-    # First try fast remux
-    # --------------------------------------------------------
-
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    stdout, stderr = await process.communicate()
-
-    if process.returncode == 0:
-        return output_path
-
-    # --------------------------------------------------------
-    # Re-encode fallback
-    # --------------------------------------------------------
-
-    if status_message:
-        try:
-            await status_message.edit_text(
-                "🎞️ <b>Converting to MP4...</b>\n\n"
-                "This may take some time.",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    if output_path.exists():
-        try:
-            output_path.unlink()
-        except Exception:
-            pass
-
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    stdout, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        error = stderr.decode(
-            "utf-8",
-            errors="ignore",
-        )
-
-        raise RuntimeError(
-            "FFmpeg conversion failed:\n"
-            + error[-3000:]
-        )
-
-    return output_path
+        return False
 
 
 # ============================================================
-# THUMBNAIL
-# ============================================================
-
-async def normalize_thumbnail(
-    input_path,
-    output_path,
-):
-    """
-    Make Telegram-friendly JPEG thumbnail.
-    """
-
-    if not ffmpeg_available():
-        shutil.copy2(
-            input_path,
-            output_path,
-        )
-        return output_path
-
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-vf",
-        (
-            "scale=320:320:"
-            "force_original_aspect_ratio=decrease"
-        ),
-        "-frames:v",
-        "1",
-        "-q:v",
-        "5",
-        str(output_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    stdout, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        shutil.copy2(
-            input_path,
-            output_path,
-        )
-
-    return output_path
-
-
-async def extract_thumbnail(
-    video_path,
-    output_path,
-):
-    if not ffmpeg_available():
-        return None
-
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-ss",
-        "00:00:03",
-        "-i",
-        str(video_path),
-        "-frames:v",
-        "1",
-        "-vf",
-        (
-            "scale=320:320:"
-            "force_original_aspect_ratio=decrease"
-        ),
-        "-q:v",
-        "5",
-        str(output_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    stdout, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        return None
-
-    if output_path.exists():
-        return output_path
-
-    return None
-
-
-async def download_thumbnail(
-    url,
-    output_path,
-):
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
-        )
-    }
-
-    timeout = aiohttp.ClientTimeout(
-        total=120
-    )
-
-    raw_path = output_path.with_suffix(".raw")
-
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        headers=headers,
-    ) as session:
-
-        async with session.get(
-            url,
-            allow_redirects=True,
-        ) as response:
-
-            response.raise_for_status()
-
-            with open(raw_path, "wb") as f:
-
-                async for chunk in response.content.iter_chunked(
-                    256 * 1024
-                ):
-
-                    f.write(chunk)
-
-    try:
-        await normalize_thumbnail(
-            raw_path,
-            output_path,
-        )
-    finally:
-        try:
-            raw_path.unlink()
-        except Exception:
-            pass
-
-    return output_path
-
-
-# ============================================================
-# TELEGRAM PARALLEL UPLOADER
+# PARALLEL MTProto UPLOADER
 # ============================================================
 
 class ParallelMTProtoUploader:
@@ -726,36 +1095,45 @@ class ParallelMTProtoUploader:
         workers=UPLOAD_WORKERS,
         part_size=PART_SIZE,
     ):
+
         self.client = client
+
         self.workers = workers
+
         self.part_size = part_size
 
-    async def _create_sender(self):
-        """
-        IMPORTANT:
-        We use the CURRENT session DC.
+    async def _create_sender(
+        self,
+    ):
 
-        This avoids:
-            Failed to get DC None (cdn = False)
-        """
+        # IMPORTANT:
+        # Use current session DC.
+        # Never use None.
 
-        dc_id = self.client.session.dc_id
+        dc_id = (
+            self.client.session.dc_id
+        )
 
         if not dc_id:
+
             raise RuntimeError(
-                "Telegram session DC ID is unavailable."
+                "Telegram session DC ID "
+                "is unavailable."
             )
 
-        # Get actual DC information
         dc = await self.client._get_dc(
             dc_id
         )
 
-        auth_key = self.client.session.auth_key
+        auth_key = (
+            self.client.session.auth_key
+        )
 
         if auth_key is None:
+
             raise RuntimeError(
-                "Telegram session AuthKey is unavailable."
+                "Telegram session AuthKey "
+                "is unavailable."
             )
 
         sender = MTProtoSender(
@@ -784,7 +1162,16 @@ class ParallelMTProtoUploader:
         part_index,
         total_parts,
         data,
+        cancel_event=None,
     ):
+
+        if (
+            cancel_event
+            and cancel_event.is_set()
+        ):
+
+            raise asyncio.CancelledError()
+
         request = SaveBigFilePartRequest(
             file_id=file_id,
             file_part=part_index,
@@ -793,6 +1180,13 @@ class ParallelMTProtoUploader:
         )
 
         while True:
+
+            if (
+                cancel_event
+                and cancel_event.is_set()
+            ):
+
+                raise asyncio.CancelledError()
 
             try:
 
@@ -816,43 +1210,69 @@ class ParallelMTProtoUploader:
         self,
         file_path,
         progress_callback=None,
+        cancel_event=None,
     ):
-        file_path = Path(file_path)
 
-        file_size = file_path.stat().st_size
-
-        total_parts = math.ceil(
-            file_size / self.part_size
+        file_path = Path(
+            file_path
         )
 
-        file_id = helpers.generate_random_long()
+        file_size = (
+            file_path.stat().st_size
+        )
+
+        total_parts = math.ceil(
+            file_size
+            / self.part_size
+        )
+
+        file_id = (
+            helpers.generate_random_long()
+        )
 
         workers = min(
             self.workers,
             total_parts,
         )
 
-        # ----------------------------------------------------
-        # Create parallel MTProto connections
-        # ----------------------------------------------------
-
         senders = []
 
         try:
 
-            for _ in range(workers):
+            # ----------------------------------------------
+            # Create 12 connections
+            # ----------------------------------------------
 
-                sender = await self._create_sender()
+            for _ in range(
+                workers
+            ):
 
-                senders.append(sender)
+                if (
+                    cancel_event
+                    and cancel_event.is_set()
+                ):
+
+                    raise asyncio.CancelledError()
+
+                sender = (
+                    await self._create_sender()
+                )
+
+                senders.append(
+                    sender
+                )
 
             sent_bytes = 0
-            progress_lock = asyncio.Lock()
+
+            progress_lock = (
+                asyncio.Lock()
+            )
 
             async def worker(
                 worker_index,
                 sender,
             ):
+
                 nonlocal sent_bytes
 
                 with open(
@@ -860,15 +1280,18 @@ class ParallelMTProtoUploader:
                     "rb",
                 ) as f:
 
-                    # Each worker gets:
-                    # worker_index,
-                    # worker_index + workers,
-                    # worker_index + workers*2...
                     for part_index in range(
                         worker_index,
                         total_parts,
                         workers,
                     ):
+
+                        if (
+                            cancel_event
+                            and cancel_event.is_set()
+                        ):
+
+                            raise asyncio.CancelledError()
 
                         offset = (
                             part_index
@@ -890,21 +1313,21 @@ class ParallelMTProtoUploader:
                             part_index,
                             total_parts,
                             data,
+                            cancel_event,
                         )
 
                         async with progress_lock:
 
-                            sent_bytes += len(data)
+                            sent_bytes += len(
+                                data
+                            )
 
                             if progress_callback:
+
                                 await progress_callback(
                                     sent_bytes,
                                     file_size,
                                 )
-
-            # ------------------------------------------------
-            # START ALL WORKERS
-            # ------------------------------------------------
 
             tasks = [
                 asyncio.create_task(
@@ -913,7 +1336,9 @@ class ParallelMTProtoUploader:
                         senders[i],
                     )
                 )
-                for i in range(workers)
+                for i in range(
+                    workers
+                )
             ]
 
             await asyncio.gather(
@@ -922,14 +1347,12 @@ class ParallelMTProtoUploader:
 
         finally:
 
-            # ------------------------------------------------
-            # CLOSE ALL CONNECTIONS
-            # ------------------------------------------------
-
             for sender in senders:
 
                 try:
+
                     await sender.disconnect()
+
                 except Exception:
                     pass
 
@@ -941,7 +1364,7 @@ class ParallelMTProtoUploader:
 
 
 # ============================================================
-# LARGE FILE SEND WITH THUMBNAIL
+# SEND LARGE VIDEO
 # ============================================================
 
 async def send_large_video(
@@ -953,13 +1376,19 @@ async def send_large_video(
     height=0,
     duration=0,
     status_message=None,
+    cancel_event=None,
 ):
-    video_path = Path(video_path)
 
-    uploader = ParallelMTProtoUploader(
-        telethon_client,
-        workers=UPLOAD_WORKERS,
-        part_size=PART_SIZE,
+    video_path = Path(
+        video_path
+    )
+
+    uploader = (
+        ParallelMTProtoUploader(
+            telethon_client,
+            workers=UPLOAD_WORKERS,
+            part_size=PART_SIZE,
+        )
     )
 
     start_time = time.monotonic()
@@ -968,9 +1397,12 @@ async def send_large_video(
         sent,
         total,
     ):
+
         now = time.monotonic()
 
-        elapsed = now - start_time
+        elapsed = (
+            now - start_time
+        )
 
         speed = (
             sent / elapsed
@@ -992,7 +1424,6 @@ async def send_large_video(
 
         if status_message:
 
-            # Throttle edits
             last = getattr(
                 progress_callback,
                 "_last",
@@ -1016,7 +1447,8 @@ async def send_large_video(
                         f"⚡ {format_bytes(speed)}/s\n"
                         f"⏱ {format_time(elapsed)}\n"
                         f"🕐 ETA {format_time(eta)}\n\n"
-                        f"🚀 Workers: {UPLOAD_WORKERS}",
+                        f"🚀 Workers: "
+                        f"{UPLOAD_WORKERS}",
                         parse_mode="HTML",
                     )
 
@@ -1025,18 +1457,28 @@ async def send_large_video(
 
                 progress_callback._last = now
 
-    # --------------------------------------------------------
-    # UPLOAD VIDEO ONLY ONCE
-    # --------------------------------------------------------
+    # ========================================================
+    # VIDEO UPLOAD — ONLY ONCE
+    # ========================================================
 
-    input_file = await uploader.upload(
-        video_path,
-        progress_callback,
+    input_file = (
+        await uploader.upload(
+            video_path,
+            progress_callback,
+            cancel_event,
+        )
     )
 
-    # --------------------------------------------------------
+    if (
+        cancel_event
+        and cancel_event.is_set()
+    ):
+
+        raise asyncio.CancelledError()
+
+    # ========================================================
     # THUMBNAIL
-    # --------------------------------------------------------
+    # ========================================================
 
     thumb_input = None
 
@@ -1050,18 +1492,20 @@ async def send_large_video(
 
             try:
 
-                # Thumbnail is small, standard Telethon upload
-                thumb_input = await telethon_client.upload_file(
-                    str(thumbnail_path),
-                    part_size_kb=128,
+                thumb_input = (
+                    await telethon_client.upload_file(
+                        str(thumbnail_path),
+                        part_size_kb=128,
+                    )
                 )
 
             except Exception:
+
                 thumb_input = None
 
-    # --------------------------------------------------------
-    # DOCUMENT ATTRIBUTES
-    # --------------------------------------------------------
+    # ========================================================
+    # ATTRIBUTES
+    # ========================================================
 
     attributes = [
         types.DocumentAttributeFilename(
@@ -1069,31 +1513,40 @@ async def send_large_video(
         )
     ]
 
-    if width > 0 and height > 0:
+    if (
+        width > 0
+        and height > 0
+    ):
 
         attributes.append(
             types.DocumentAttributeVideo(
-                duration=int(duration or 0),
+                duration=int(
+                    duration or 0
+                ),
                 w=int(width),
                 h=int(height),
                 supports_streaming=True,
             )
         )
 
-    # --------------------------------------------------------
-    # SEND ALREADY UPLOADED FILE
-    # --------------------------------------------------------
+    # ========================================================
+    # SEND MEDIA
+    # ========================================================
 
-    peer = await telethon_client.get_input_entity(
-        chat_id
+    peer = (
+        await telethon_client.get_input_entity(
+            chat_id
+        )
     )
 
-    media = types.InputMediaUploadedDocument(
-        file=input_file,
-        thumb=thumb_input,
-        mime_type="video/mp4",
-        attributes=attributes,
-        force_file=False,
+    media = (
+        types.InputMediaUploadedDocument(
+            file=input_file,
+            thumb=thumb_input,
+            mime_type="video/mp4",
+            attributes=attributes,
+            force_file=False,
+        )
     )
 
     result = await telethon_client(
@@ -1109,154 +1562,194 @@ async def send_large_video(
 
 
 # ============================================================
-# PARSE USER MESSAGE
+# QUEUE DISPLAY
 # ============================================================
 
-def parse_request(text):
-    """
-    Supports:
+async def get_queue_text():
 
-    Video: https://...
-    Thumbnail: https://...
-    """
+    async with queue_lock:
 
-    video_url = None
-    thumbnail_url = None
+        lines = [
+            "📋 <b>UPLOAD QUEUE</b>",
+            "",
+        ]
 
-    video_match = re.search(
-        r'Video\s*:\s*(https?://\S+)',
-        text,
-        re.I,
-    )
+        if current_item:
 
-    if video_match:
-        video_url = video_match.group(1).strip()
+            lines.append(
+                "🔄 <b>Currently processing:</b>"
+            )
 
-    thumb_match = re.search(
-        r'Thumbnail\s*:\s*(https?://\S+)',
-        text,
-        re.I,
-    )
+            lines.append(
+                f"🎬 {current_item.number}. "
+                f"{current_item.video_url}"
+            )
 
-    if thumb_match:
-        thumbnail_url = thumb_match.group(1).strip()
+            lines.append("")
 
-    # If plain URL only
-    if not video_url:
+        if not queue_items:
 
-        urls = re.findall(
-            r'https?://\S+',
-            text,
-            re.I,
+            lines.append(
+                "📭 Queue is empty."
+            )
+
+        else:
+
+            for i, item in enumerate(
+                queue_items,
+                start=1,
+            ):
+
+                lines.append(
+                    f"⏳ {i}. "
+                    f"{item.video_url}"
+                )
+
+        return "\n".join(
+            lines
         )
 
-        if urls:
-            video_url = urls[0].strip()
 
-    return video_url, thumbnail_url
+# ============================================================
+# QUEUE WORKER
+# ============================================================
+
+async def queue_worker():
+
+    global current_item
+    global current_cancel_event
+
+    while True:
+
+        item = await queue.get()
+
+        async with queue_lock:
+
+            if item in queue_items:
+
+                queue_items.remove(
+                    item
+                )
+
+            current_item = item
+
+            current_cancel_event = (
+                asyncio.Event()
+            )
+
+        try:
+
+            await process_queue_item(
+                item
+            )
+
+        except asyncio.CancelledError:
+
+            try:
+
+                await telethon_client.send_message(
+                    item.chat_id,
+                    "🛑 <b>Cancelled</b>\n\n"
+                    f"🎬 {item.video_url}",
+                    parse_mode="HTML",
+                )
+
+            except Exception:
+                pass
+
+        except Exception as e:
+
+            print(
+                "QUEUE ERROR:",
+                repr(e),
+            )
+
+            try:
+
+                await telethon_client.send_message(
+                    item.chat_id,
+                    "❌ <b>Queue Item Failed</b>\n\n"
+                    f"<code>{str(e)[:2500]}</code>",
+                    parse_mode="HTML",
+                )
+
+            except Exception:
+                pass
+
+        finally:
+
+            async with queue_lock:
+
+                current_item = None
+
+                current_cancel_event = None
+
+            queue.task_done()
 
 
 # ============================================================
-# START COMMAND
+# PROCESS ONE QUEUE ITEM
 # ============================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+async def process_queue_item(
+    item,
 ):
-    await update.message.reply_text(
-        "🎬 <b>Movie Upload Bot</b>\n\n"
-        "Send me a video URL.\n\n"
-        "Example:\n"
-        "<code>Video: https://example.com/video.mp4</code>\n\n"
-        "Optional:\n"
-        "<code>Thumbnail: https://example.com/thumb.jpg</code>",
-        parse_mode="HTML",
+
+    global current_cancel_event
+
+    cancel_event = (
+        current_cancel_event
     )
 
-
-# ============================================================
-# MAIN MESSAGE HANDLER
-# ============================================================
-
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not update.message:
-        return
-
-    text = update.message.text or ""
-
-    video_url, thumbnail_url = parse_request(
-        text
-    )
-
-    if not video_url:
-
-        await update.message.reply_text(
-            "❌ Video URL မတွေ့ပါဘူး။\n\n"
-            "ဥပမာ:\n"
-            "Video: https://example.com/video.mp4"
-        )
-
-        return
-
-    if not is_http_url(video_url):
-
-        await update.message.reply_text(
-            "❌ Invalid video URL."
-        )
-
-        return
-
-    status = await update.message.reply_text(
+    status = await telethon_client.send_message(
+        item.chat_id,
         "🔎 <b>Checking URL...</b>",
         parse_mode="HTML",
     )
 
-    video_download_url = video_url
+    video_url = item.video_url
 
-    # --------------------------------------------------------
+    thumbnail_url = item.thumbnail_url
+
+    # ========================================================
     # MEDIAFIRE
-    # --------------------------------------------------------
+    # ========================================================
 
-    if is_mediafire_url(video_url):
+    if is_mediafire_url(
+        video_url
+    ):
 
-        try:
+        await status.edit(
+            "🔎 <b>Resolving MediaFire...</b>",
+            parse_mode="HTML",
+        )
 
-            await status.edit_text(
-                "🔎 <b>Resolving MediaFire...</b>",
-                parse_mode="HTML",
-            )
-
-            resolved = await resolve_mediafire(
+        resolved = (
+            await resolve_mediafire(
                 video_url
             )
+        )
 
-            if not resolved:
-                raise RuntimeError(
-                    "Could not resolve MediaFire download link."
-                )
+        if not resolved:
 
-            video_download_url = resolved
-
-        except Exception as e:
-
-            await status.edit_text(
-                "❌ <b>MediaFire Error</b>\n\n"
-                f"<code>{str(e)[:1500]}</code>",
-                parse_mode="HTML",
+            raise RuntimeError(
+                "Could not resolve MediaFire download link."
             )
 
-            return
+        video_download_url = resolved
 
-    # --------------------------------------------------------
-    # FILE NAME
-    # --------------------------------------------------------
+    else:
 
-    filename = get_filename_from_url(
-        video_download_url
+        video_download_url = video_url
+
+    # ========================================================
+    # FILENAME
+    # ========================================================
+
+    filename = (
+        get_filename_from_url(
+            video_download_url
+        )
     )
 
     if not filename:
@@ -1273,155 +1766,152 @@ async def handle_message(
             ".m4v",
         )
     ):
+
         filename += ".mp4"
 
     filename = safe_filename(
         filename
     )
 
-    download_path = (
-        DOWNLOAD_DIR / filename
+    timestamp = int(
+        time.time() * 1000
     )
 
-    # Avoid overwrite
-    if download_path.exists():
+    download_path = (
+        DOWNLOAD_DIR
+        / f"{timestamp}_{filename}"
+    )
 
-        timestamp = int(time.time())
-
-        download_path = (
-            DOWNLOAD_DIR
-            / f"{download_path.stem}_{timestamp}"
-            f"{download_path.suffix}"
-        )
-
-    # --------------------------------------------------------
+    # ========================================================
     # DOWNLOAD
-    # --------------------------------------------------------
+    # ========================================================
+
+    await status.edit(
+        "⬇️ <b>Starting download...</b>",
+        parse_mode="HTML",
+    )
 
     try:
-
-        await status.edit_text(
-            "⬇️ <b>Starting download...</b>",
-            parse_mode="HTML",
-        )
 
         result = await download_file(
             video_download_url,
             download_path,
             status,
+            cancel_event,
         )
 
-        # If server supplied filename
-        header_filename = result.get(
+    except asyncio.CancelledError:
+
+        raise
+
+    header_filename = (
+        result.get(
             "header_filename"
         )
+    )
 
-        if (
-            header_filename
-            and download_path.name == filename
-        ):
+    if (
+        header_filename
+        and download_path.exists()
+    ):
+
+        new_path = (
+            download_path.parent
+            / safe_filename(
+                header_filename
+            )
+        )
+
+        # Don't overwrite another queue file
+        if new_path.exists():
 
             new_path = (
                 download_path.parent
-                / header_filename
+                / f"{timestamp}_"
+                f"{safe_filename(header_filename)}"
             )
 
-            if (
-                new_path != download_path
-                and not new_path.exists()
-            ):
-                try:
-                    download_path.rename(
-                        new_path
-                    )
-                    download_path = new_path
-                except Exception:
-                    pass
+        try:
 
-    except Exception as e:
+            download_path.rename(
+                new_path
+            )
 
-        await status.edit_text(
-            "❌ <b>Download Error</b>\n\n"
-            f"<code>{str(e)[:2500]}</code>",
-            parse_mode="HTML",
-        )
+            download_path = new_path
 
-        return
+        except Exception:
+            pass
 
-    # --------------------------------------------------------
+    # ========================================================
     # VALIDATE
-    # --------------------------------------------------------
+    # ========================================================
 
     if not download_path.exists():
 
-        await status.edit_text(
-            "❌ Downloaded file not found."
+        raise RuntimeError(
+            "Downloaded file not found."
         )
 
-        return
+    if (
+        download_path.stat().st_size
+        == 0
+    ):
 
-    if download_path.stat().st_size == 0:
-
-        await status.edit_text(
-            "❌ Downloaded file is empty."
+        raise RuntimeError(
+            "Downloaded file is empty."
         )
 
-        return
+    if (
+        cancel_event
+        and cancel_event.is_set()
+    ):
 
-    # --------------------------------------------------------
-    # CONVERT MP4
-    # --------------------------------------------------------
+        raise asyncio.CancelledError()
+
+    # ========================================================
+    # CONVERT
+    # ========================================================
 
     converted_path = (
         CONVERT_DIR
         / f"{download_path.stem}.mp4"
     )
 
-    try:
+    if (
+        download_path.suffix.lower()
+        == ".mp4"
+        and is_valid_mp4(
+            download_path
+        )
+    ):
 
-        if (
-            download_path.suffix.lower()
-            == ".mp4"
-            and is_valid_mp4(download_path)
-        ):
-
-            converted_path = download_path
-
-        else:
-
-            await convert_to_mp4(
-                download_path,
-                converted_path,
-                status,
-            )
-
-    except Exception as e:
-
-        await status.edit_text(
-            "❌ <b>Video Conversion Error</b>\n\n"
-            f"<code>{str(e)[:2500]}</code>",
-            parse_mode="HTML",
+        converted_path = (
+            download_path
         )
 
-        return
+    else:
 
-    # --------------------------------------------------------
+        await convert_to_mp4(
+            download_path,
+            converted_path,
+            status,
+            cancel_event,
+        )
+
+    if (
+        cancel_event
+        and cancel_event.is_set()
+    ):
+
+        raise asyncio.CancelledError()
+
+    # ========================================================
     # VIDEO INFO
-    # --------------------------------------------------------
+    # ========================================================
 
-    try:
-
-        info = await probe_video(
-            converted_path
-        )
-
-    except Exception:
-
-        info = {
-            "width": 0,
-            "height": 0,
-            "duration": 0,
-        }
+    info = await probe_video(
+        converted_path
+    )
 
     width = info.get(
         "width",
@@ -1438,20 +1928,20 @@ async def handle_message(
         0,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # THUMBNAIL
-    # --------------------------------------------------------
+    # ========================================================
 
     thumbnail_path = None
 
     try:
 
-        if thumbnail_url:
+        thumbnail_path = (
+            CONVERT_DIR
+            / f"{converted_path.stem}_thumb.jpg"
+        )
 
-            thumbnail_path = (
-                CONVERT_DIR
-                / f"{converted_path.stem}_thumb.jpg"
-            )
+        if thumbnail_url:
 
             await download_thumbnail(
                 thumbnail_url,
@@ -1460,156 +1950,472 @@ async def handle_message(
 
         else:
 
-            thumbnail_path = (
-                CONVERT_DIR
-                / f"{converted_path.stem}_thumb.jpg"
-            )
-
-            extracted = await extract_thumbnail(
-                converted_path,
-                thumbnail_path,
+            extracted = (
+                await extract_thumbnail(
+                    converted_path,
+                    thumbnail_path,
+                )
             )
 
             if not extracted:
+
                 thumbnail_path = None
 
     except Exception:
 
         thumbnail_path = None
 
-    # --------------------------------------------------------
-    # FILE SIZE
-    # --------------------------------------------------------
+    # ========================================================
+    # SIZE
+    # ========================================================
 
-    file_size = converted_path.stat().st_size
+    file_size = (
+        converted_path.stat().st_size
+    )
 
-    # --------------------------------------------------------
+    # ========================================================
     # CAPTION
-    # --------------------------------------------------------
+    # ========================================================
 
     caption = (
         f"🎬 <b>{converted_path.name}</b>\n\n"
-        f"📦 Size: {format_bytes(file_size)}\n"
+        f"📦 Size: "
+        f"{format_bytes(file_size)}\n"
         f"📐 Resolution: "
         f"{width}×{height}\n"
         f"⏱ Duration: "
         f"{format_time(duration)}"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # SEND
-    # --------------------------------------------------------
+    # ========================================================
 
-    try:
+    if (
+        cancel_event
+        and cancel_event.is_set()
+    ):
 
-        if file_size <= BOT_API_LIMIT:
+        raise asyncio.CancelledError()
 
-            # ----------------------------------------------
-            # SMALL FILE
-            # ----------------------------------------------
+    if file_size <= BOT_API_LIMIT:
 
-            await status.edit_text(
-                "⬆️ <b>Uploading...</b>",
-                parse_mode="HTML",
-            )
-
-            with open(
-                converted_path,
-                "rb",
-            ) as video_file:
-
-                await update.message.reply_video(
-                    video=video_file,
-                    caption=caption,
-                    parse_mode="HTML",
-                    duration=int(duration or 0),
-                    width=int(width or 0),
-                    height=int(height or 0),
-                    supports_streaming=True,
-                    thumbnail=(
-                        open(thumbnail_path, "rb")
-                        if thumbnail_path
-                        else None
-                    ),
-                    read_timeout=300,
-                    write_timeout=300,
-                    connect_timeout=60,
-                )
-
-        else:
-
-            # ----------------------------------------------
-            # LARGE FILE
-            # MTProto PARALLEL UPLOAD
-            # ----------------------------------------------
-
-            await status.edit_text(
-                "🚀 <b>Starting parallel Telegram upload...</b>\n\n"
-                f"📦 {format_bytes(file_size)}\n"
-                f"⚡ Workers: {UPLOAD_WORKERS}\n"
-                f"🧩 Part size: 512 KB",
-                parse_mode="HTML",
-            )
-
-            await send_large_video(
-                chat_id=update.effective_chat.id,
-                video_path=converted_path,
-                caption=caption,
-                thumbnail_path=thumbnail_path,
-                width=width,
-                height=height,
-                duration=duration,
-                status_message=status,
-            )
-
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
-
-        try:
-            await status.delete()
-        except Exception:
-            pass
-
-    except Exception as e:
-
-        await status.edit_text(
-            "❌ <b>Telegram Upload Error</b>\n\n"
-            f"<code>{str(e)[:3000]}</code>",
+        await status.edit(
+            "⬆️ <b>Uploading...</b>",
             parse_mode="HTML",
         )
 
-    finally:
+        video_file = open(
+            converted_path,
+            "rb",
+        )
 
-        # ----------------------------------------------------
-        # CLEAN TEMP FILES
-        # ----------------------------------------------------
-
-        try:
-            if (
-                download_path.exists()
-                and download_path != converted_path
-            ):
-                download_path.unlink()
-        except Exception:
-            pass
+        thumb_file = None
 
         try:
-            if (
-                converted_path.exists()
-                and converted_path != download_path
-            ):
-                converted_path.unlink()
-        except Exception:
-            pass
 
-        if thumbnail_path:
+            if thumbnail_path:
+
+                try:
+
+                    thumb_file = open(
+                        thumbnail_path,
+                        "rb",
+                    )
+
+                except Exception:
+
+                    thumb_file = None
+
+            await telethon_client.send_file(
+                item.chat_id,
+                video_file,
+                caption=caption,
+                parse_mode="HTML",
+                supports_streaming=True,
+                thumb=thumb_file,
+            )
+
+        finally:
+
+            video_file.close()
+
+            if thumb_file:
+
+                thumb_file.close()
+
+    else:
+
+        await status.edit(
+            "🚀 <b>Starting parallel Telegram upload...</b>\n\n"
+            f"📦 {format_bytes(file_size)}\n"
+            f"⚡ Workers: "
+            f"{UPLOAD_WORKERS}\n"
+            f"🧩 Part size: 512 KB",
+            parse_mode="HTML",
+        )
+
+        await send_large_video(
+            chat_id=item.chat_id,
+            video_path=converted_path,
+            caption=caption,
+            thumbnail_path=thumbnail_path,
+            width=width,
+            height=height,
+            duration=duration,
+            status_message=status,
+            cancel_event=cancel_event,
+        )
+
+    # ========================================================
+    # SUCCESS
+    # ========================================================
+
+    try:
+
+        await status.edit(
+            "✅ <b>Upload completed!</b>\n\n"
+            f"🎬 {converted_path.name}\n"
+            f"📦 {format_bytes(file_size)}\n"
+            f"📐 {width}×{height}\n"
+            f"⏱ {format_time(duration)}",
+            parse_mode="HTML",
+        )
+
+    except Exception:
+        pass
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    await cleanup_files(
+        download_path,
+        converted_path,
+        thumbnail_path,
+    )
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
+async def cleanup_files(
+    download_path,
+    converted_path,
+    thumbnail_path,
+):
+
+    paths = [
+        download_path,
+        converted_path,
+        thumbnail_path,
+    ]
+
+    for path in paths:
+
+        if not path:
+            continue
+
+        try:
+
+            path = Path(path)
+
+            if path.exists():
+
+                path.unlink()
+
+        except Exception as e:
+
+            print(
+                "Cleanup error:",
+                e,
+            )
+
+
+# ============================================================
+# /START
+# ============================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        "🎬 <b>Movie Upload Bot</b>\n\n"
+        "Send one or multiple video URLs.\n\n"
+        "<b>Example:</b>\n\n"
+        "<code>Video: https://site.com/a.mp4\n"
+        "Thumbnail: https://site.com/a.jpg\n\n"
+        "Video: https://site.com/b.mp4\n"
+        "Thumbnail: https://site.com/b.jpg</code>\n\n"
+        "Commands:\n"
+        "/queue - Queue ကြည့်ရန်\n"
+        "/clear - Waiting queue ရှင်းရန်\n"
+        "/cancel - လက်ရှိအလုပ် Cancel",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# /QUEUE
+# ============================================================
+
+async def queue_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    text = await get_queue_text()
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# /CLEAR
+# ============================================================
+
+async def clear_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    async with queue_lock:
+
+        count = len(
+            queue_items
+        )
+
+        queue_items.clear()
+
+        # Drain asyncio queue
+        while not queue.empty():
 
             try:
-                if thumbnail_path.exists():
-                    thumbnail_path.unlink()
-            except Exception:
-                pass
+
+                queue.get_nowait()
+
+                queue.task_done()
+
+            except asyncio.QueueEmpty:
+
+                break
+
+    await update.message.reply_text(
+        "🧹 <b>Queue cleared.</b>\n\n"
+        f"Removed: {count}",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# /CANCEL
+# ============================================================
+
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    global current_cancel_event
+
+    if not current_item:
+
+        await update.message.reply_text(
+            "ℹ️ လက်ရှိ processing လုပ်နေတဲ့ item မရှိပါဘူး။"
+        )
+
+        return
+
+    if (
+        current_item.chat_id
+        != update.effective_chat.id
+    ):
+
+        await update.message.reply_text(
+            "❌ ဒီ queue ကို သင် cancel လုပ်လို့မရပါဘူး။"
+        )
+
+        return
+
+    if current_cancel_event:
+
+        current_cancel_event.set()
+
+        await update.message.reply_text(
+            "🛑 <b>Cancel requested.</b>\n\n"
+            "လက်ရှိ operation ရပ်သွားပြီး cleanup လုပ်ပါမယ်။",
+            parse_mode="HTML",
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "ℹ️ Cancel event မရသေးပါဘူး။"
+        )
+
+
+# ============================================================
+# MESSAGE HANDLER
+# ============================================================
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not update.message:
+
+        return
+
+    text = (
+        update.message.text
+        or ""
+    )
+
+    parsed = (
+        parse_multiple_requests(
+            text
+        )
+    )
+
+    if not parsed:
+
+        await update.message.reply_text(
+            "❌ Video URL မတွေ့ပါဘူး။\n\n"
+            "ဥပမာ:\n"
+            "<code>Video: https://site.com/video.mp4</code>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    valid_items = []
+
+    for video_url, thumb_url in parsed:
+
+        if not is_http_url(
+            video_url
+        ):
+
+            continue
+
+        valid_items.append(
+            (
+                video_url,
+                thumb_url,
+            )
+        )
+
+    if not valid_items:
+
+        await update.message.reply_text(
+            "❌ Valid HTTP/HTTPS video URL မတွေ့ပါဘူး။"
+        )
+
+        return
+
+    # ========================================================
+    # ADD TO QUEUE
+    # ========================================================
+
+    added = []
+
+    async with queue_lock:
+
+        start_number = (
+            len(queue_items)
+            + (
+                1
+                if current_item
+                else 0
+            )
+        )
+
+        for index, (
+            video_url,
+            thumb_url,
+        ) in enumerate(
+            valid_items,
+            start=1,
+        ):
+
+            item = QueueItem(
+                video_url=video_url,
+                thumbnail_url=thumb_url,
+                chat_id=update.effective_chat.id,
+                user_id=(
+                    update.effective_user.id
+                    if update.effective_user
+                    else 0
+                ),
+                number=start_number + index,
+            )
+
+            queue_items.append(
+                item
+            )
+
+            await queue.put(
+                item
+            )
+
+            added.append(
+                item
+            )
+
+    # ========================================================
+    # QUEUE MESSAGE
+    # ========================================================
+
+    lines = [
+        "📥 <b>Added to Queue</b>",
+        "",
+        f"🎬 Links: {len(added)}",
+        "",
+    ]
+
+    for i, item in enumerate(
+        added,
+        start=1,
+    ):
+
+        short_url = (
+            item.video_url
+        )
+
+        if len(short_url) > 80:
+
+            short_url = (
+                short_url[:77]
+                + "..."
+            )
+
+        lines.append(
+            f"{i}. {short_url}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "📋 <b>Queue:</b>",
+            f"⏳ Waiting: "
+            f"{len(queue_items)}",
+            "",
+            "🔄 တစ်ခုချင်းစီကို "
+            "Download → Upload ပြီးမှ "
+            "နောက်တစ်ခု ဆက်လုပ်ပါမယ်။",
+        ]
+    )
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
 
 
 # ============================================================
@@ -1620,6 +2426,7 @@ async def error_handler(
     update,
     context,
 ):
+
     print(
         "BOT ERROR:",
         repr(context.error),
@@ -1631,9 +2438,20 @@ async def error_handler(
 # ============================================================
 
 async def main():
-    print("=" * 60)
-    print("Movie Upload Bot")
-    print("=" * 60)
+
+    global queue_worker_task
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Movie Upload Bot"
+    )
+
+    print(
+        "=" * 60
+    )
 
     print(
         "UPLOAD WORKERS:",
@@ -1642,39 +2460,59 @@ async def main():
 
     print(
         "PART SIZE:",
-        format_bytes(PART_SIZE),
+        format_bytes(
+            PART_SIZE
+        ),
     )
 
     print(
         "FFMPEG:",
-        shutil.which("ffmpeg"),
+        shutil.which(
+            "ffmpeg"
+        ),
     )
 
     print(
         "FFPROBE:",
-        shutil.which("ffprobe"),
+        shutil.which(
+            "ffprobe"
+        ),
     )
 
-    print("=" * 60)
+    print(
+        "=" * 60
+    )
 
-    # --------------------------------------------------------
-    # TELETHON LOGIN
-    # --------------------------------------------------------
+    # ========================================================
+    # TELETHON
+    # ========================================================
 
     await telethon_client.start(
         bot_token=BOT_TOKEN
     )
 
-    me = await telethon_client.get_me()
+    me = (
+        await telethon_client.get_me()
+    )
 
     print(
         "Telethon connected:",
         me.username or me.id,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
+    # QUEUE WORKER
+    # ========================================================
+
+    queue_worker_task = (
+        asyncio.create_task(
+            queue_worker()
+        )
+    )
+
+    # ========================================================
     # PYTHON TELEGRAM BOT
-    # --------------------------------------------------------
+    # ========================================================
 
     application = (
         Application.builder()
@@ -1690,6 +2528,27 @@ async def main():
     )
 
     application.add_handler(
+        CommandHandler(
+            "queue",
+            queue_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "clear",
+            clear_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "cancel",
+            cancel_command,
+        )
+    )
+
+    application.add_handler(
         MessageHandler(
             filters.TEXT
             & ~filters.COMMAND,
@@ -1701,10 +2560,16 @@ async def main():
         error_handler
     )
 
-    print("Bot is running...")
+    print(
+        "Bot is running..."
+    )
 
-    # Start polling
+    # ========================================================
+    # START
+    # ========================================================
+
     await application.initialize()
+
     await application.start()
 
     if application.updater:
@@ -1714,18 +2579,41 @@ async def main():
     try:
 
         while True:
-            await asyncio.sleep(3600)
+
+            await asyncio.sleep(
+                3600
+            )
 
     finally:
 
+        if queue_worker_task:
+
+            queue_worker_task.cancel()
+
+            try:
+
+                await queue_worker_task
+
+            except asyncio.CancelledError:
+                pass
+
         if application.updater:
+
             await application.updater.stop()
 
         await application.stop()
+
         await application.shutdown()
 
         await telethon_client.disconnect()
 
 
+# ============================================================
+# RUN
+# ============================================================
+
 if __name__ == "__main__":
-    asyncio.run(main())
+
+    asyncio.run(
+        main()
+    )
