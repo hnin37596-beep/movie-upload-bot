@@ -637,6 +637,17 @@ async def convert_to_mp4(
             "FFmpeg is not installed."
         )
 
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+
+    # --------------------------------------------------------
+    # MKV/other containers: first try a clean remux.
+    # Only the first video and first audio stream are selected.
+    # Subtitles, attachments and data streams are excluded.
+    # This is important for MKV files because many of them can
+    # be placed in MP4 without re-encoding the video.
+    # --------------------------------------------------------
+
     if status_message:
 
         try:
@@ -649,30 +660,43 @@ async def convert_to_mp4(
         except Exception:
             pass
 
-    process = (
-        await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+    if output_path.exists():
+
+        try:
+            output_path.unlink()
+        except Exception:
+            pass
+
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
 
-    stdout, stderr = (
-        await process.communicate()
-    )
+    stdout, stderr = await process.communicate()
 
-    if process.returncode == 0:
+    if process.returncode == 0 and output_path.exists():
 
         return output_path
 
+    # Remove failed/partial remux before fallback.
     if output_path.exists():
 
         try:
@@ -683,6 +707,10 @@ async def convert_to_mp4(
     if cancel_event and cancel_event.is_set():
 
         raise asyncio.CancelledError()
+
+    # --------------------------------------------------------
+    # Fallback: H.264 + AAC conversion.
+    # --------------------------------------------------------
 
     if status_message:
 
@@ -697,33 +725,38 @@ async def convert_to_mp4(
         except Exception:
             pass
 
-    process = (
-        await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
 
-    stdout, stderr = (
-        await process.communicate()
-    )
+    stdout, stderr = await process.communicate()
 
     if process.returncode != 0:
 
@@ -732,9 +765,32 @@ async def convert_to_mp4(
             errors="ignore",
         )
 
+        # FFmpeg can leave a huge partial MP4 after a disk-full
+        # failure. Delete it immediately so the queue does not
+        # consume the remaining runner storage.
+        if output_path.exists():
+
+            try:
+                output_path.unlink()
+            except Exception:
+                pass
+
+        if "No space left on device" in error:
+
+            raise RuntimeError(
+                "FFmpeg conversion failed: No space left on device.\n\n"
+                "The incomplete MP4 file was removed."
+            )
+
         raise RuntimeError(
             "FFmpeg conversion failed:\n"
             + error[-3000:]
+        )
+
+    if not output_path.exists():
+
+        raise RuntimeError(
+            "FFmpeg finished but MP4 file was not created."
         )
 
     return output_path
@@ -1891,12 +1947,39 @@ async def process_queue_item(
 
     else:
 
-        await convert_to_mp4(
-            download_path,
-            converted_path,
-            status,
-            cancel_event,
-        )
+        try:
+
+            await convert_to_mp4(
+                download_path,
+                converted_path,
+                status,
+                cancel_event,
+            )
+
+        except asyncio.CancelledError:
+
+            try:
+                if converted_path.exists():
+                    converted_path.unlink()
+            except Exception:
+                pass
+            raise
+
+        except Exception:
+
+            try:
+                if converted_path.exists():
+                    converted_path.unlink()
+            except Exception:
+                pass
+
+            try:
+                if download_path.exists():
+                    download_path.unlink()
+            except Exception:
+                pass
+
+            raise
 
     if (
         cancel_event
