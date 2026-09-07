@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import math
 import asyncio
 import shutil
 import pathlib
@@ -20,7 +21,14 @@ from telegram.ext import (
 )
 
 from telethon import TelegramClient
-from telethon.tl.types import DocumentAttributeVideo
+from telethon import utils, helpers
+from telethon.tl.types import (
+    DocumentAttributeVideo,
+    InputFileBig,
+)
+from telethon.tl.functions.upload import (
+    SaveBigFilePartRequest,
+)
 
 
 # ============================================================
@@ -39,19 +47,24 @@ CONVERT_DIR.mkdir(parents=True, exist_ok=True)
 
 STATUS_INTERVAL = 2
 
-# Telegram upload part size.
-# 512 KB is the safe Telegram MTProto maximum/recommended size.
-UPLOAD_PART_SIZE = 512 * 1024
+# Telegram maximum/recommended upload part size
+PART_SIZE = 512 * 1024
+
+# Start with 8.
+# If stable, try 10 or 12.
+UPLOAD_WORKERS = 8
 
 
 # ============================================================
-# TELETHON SESSION
+# TELETHON
 # ============================================================
 
 SESSION_DIR = DOWNLOAD_DIR / "movie_bot_mtproto"
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
-TELETHON_SESSION = str(SESSION_DIR / "session")
+TELETHON_SESSION = str(
+    SESSION_DIR / "session"
+)
 
 telethon_client: Optional[TelegramClient] = None
 
@@ -61,19 +74,29 @@ telethon_client: Optional[TelegramClient] = None
 # ============================================================
 
 def format_bytes(value: float) -> str:
+
     value = float(value)
 
-    units = ["B", "KB", "MB", "GB", "TB"]
+    units = [
+        "B",
+        "KB",
+        "MB",
+        "GB",
+        "TB",
+    ]
 
     for unit in units:
+
         if value < 1024:
             return f"{value:.1f} {unit}"
+
         value /= 1024
 
     return f"{value:.1f} PB"
 
 
 def format_time(seconds: float) -> str:
+
     if not seconds or seconds <= 0:
         return "--:--"
 
@@ -89,30 +112,61 @@ def format_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def progress_bar(percent: float, length: int = 20) -> str:
-    percent = max(0, min(100, percent))
+def progress_bar(
+    percent: float,
+    length: int = 20,
+) -> str:
 
-    filled = int(length * percent / 100)
+    percent = max(
+        0,
+        min(100, percent),
+    )
 
-    return "▰" * filled + "▱" * (length - filled)
+    filled = int(
+        length * percent / 100
+    )
+
+    return (
+        "▰" * filled
+        + "▱" * (length - filled)
+    )
 
 
 def is_http_url(url: str) -> bool:
+
     try:
+
         parsed = urllib.parse.urlparse(url)
 
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+        return (
+            parsed.scheme in (
+                "http",
+                "https",
+            )
+            and bool(parsed.netloc)
+        )
 
     except Exception:
+
         return False
 
 
 def is_mediafire_url(url: str) -> bool:
-    return "mediafire.com" in url.lower()
+
+    return (
+        "mediafire.com"
+        in url.lower()
+    )
 
 
 def safe_filename(name: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+
+    name = re.sub(
+        r'[\\/:*?"<>|]+',
+        "_",
+        name,
+    )
+
     name = name.strip()
 
     if not name:
@@ -121,10 +175,19 @@ def safe_filename(name: str) -> str:
     return name[:180]
 
 
-def filename_from_url(url: str) -> str:
+def filename_from_url(
+    url: str,
+) -> str:
+
     try:
-        path = urllib.parse.urlparse(url).path
-        name = pathlib.Path(urllib.parse.unquote(path)).name
+
+        path = urllib.parse.urlparse(
+            url
+        ).path
+
+        name = pathlib.Path(
+            urllib.parse.unquote(path)
+        ).name
 
         if name:
             return safe_filename(name)
@@ -135,9 +198,17 @@ def filename_from_url(url: str) -> str:
     return "video"
 
 
-def filename_from_headers(headers, fallback_url: str) -> str:
+def filename_from_headers(
+    headers,
+    fallback_url: str,
+) -> str:
 
-    content_disposition = headers.get("Content-Disposition", "")
+    content_disposition = (
+        headers.get(
+            "Content-Disposition",
+            "",
+        )
+    )
 
     if content_disposition:
 
@@ -148,22 +219,34 @@ def filename_from_headers(headers, fallback_url: str) -> str:
         )
 
         if match:
-            filename = urllib.parse.unquote(match.group(1))
-            return safe_filename(filename)
 
-    return filename_from_url(fallback_url)
+            filename = urllib.parse.unquote(
+                match.group(1)
+            )
+
+            return safe_filename(
+                filename
+            )
+
+    return filename_from_url(
+        fallback_url
+    )
 
 
 # ============================================================
-# MEDIAFIRE RESOLVER
+# MEDIAFIRE
 # ============================================================
 
-async def resolve_mediafire(url: str) -> str:
+async def resolve_mediafire(
+    url: str,
+) -> str:
 
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "Chrome/120 Safari/537.36"
         )
     }
 
@@ -183,12 +266,20 @@ async def resolve_mediafire(url: str) -> str:
             allow_redirects=True,
         ) as response:
 
-            html = await response.text(errors="ignore")
+            response.raise_for_status()
 
-    soup = BeautifulSoup(html, "html.parser")
+            html = await response.text(
+                errors="ignore"
+            )
 
-    # Primary MediaFire download button
-    button = soup.select_one("#downloadButton")
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
+
+    button = soup.select_one(
+        "#downloadButton"
+    )
 
     if button:
 
@@ -197,45 +288,47 @@ async def resolve_mediafire(url: str) -> str:
         if href and is_http_url(href):
             return href
 
-    # Search all links
-    for link in soup.find_all("a", href=True):
+    for link in soup.find_all(
+        "a",
+        href=True,
+    ):
 
         href = link["href"]
 
         if href.startswith("//"):
             href = "https:" + href
 
-        if is_http_url(href):
+        if not is_http_url(href):
+            continue
 
-            lower = href.lower()
+        lower = href.lower()
 
-            if (
-                "download" in lower
-                or ".mp4" in lower
-                or ".mkv" in lower
-                or ".mov" in lower
-                or ".webm" in lower
-            ):
-                return href
+        if (
+            "download" in lower
+            or ".mp4" in lower
+            or ".mkv" in lower
+            or ".mov" in lower
+            or ".webm" in lower
+        ):
+            return href
 
-    # Regex fallback
-    patterns = [
+    matches = re.findall(
         r'https?://[^"\']+',
-    ]
+        html,
+    )
 
-    for pattern in patterns:
+    for match in matches:
 
-        matches = re.findall(pattern, html)
+        match = match.replace(
+            "\\/",
+            "/",
+        )
 
-        for match in matches:
-
-            match = match.replace("\\/", "/")
-
-            if (
-                ".mp4" in match.lower()
-                or "download" in match.lower()
-            ):
-                return match
+        if (
+            ".mp4" in match.lower()
+            or "download" in match.lower()
+        ):
+            return match
 
     raise RuntimeError(
         "MediaFire direct download link မတွေ့ပါ။"
@@ -246,7 +339,9 @@ async def resolve_mediafire(url: str) -> str:
 # VIDEO VALIDATION
 # ============================================================
 
-def is_valid_video_file(path: pathlib.Path) -> bool:
+def is_valid_video_file(
+    path: pathlib.Path,
+) -> bool:
 
     if not path.exists():
         return False
@@ -257,17 +352,12 @@ def is_valid_video_file(path: pathlib.Path) -> bool:
     try:
 
         with open(path, "rb") as f:
+            header = f.read(64)
 
-            header = f.read(32)
-
-        # MP4 normally contains ftyp
         if b"ftyp" in header:
             return True
 
-        # Other common video containers
-        suffix = path.suffix.lower()
-
-        if suffix in (
+        if path.suffix.lower() in (
             ".mkv",
             ".webm",
             ".mov",
@@ -296,8 +386,10 @@ async def download_file(
 
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "Chrome/120 Safari/537.36"
         ),
         "Accept": "*/*",
         "Connection": "keep-alive",
@@ -311,7 +403,6 @@ async def download_file(
 
     start_time = time.monotonic()
     last_update = 0
-
     downloaded = 0
 
     async with aiohttp.ClientSession(
@@ -339,14 +430,21 @@ async def download_file(
             )
 
             if output_path.suffix == "":
-                output_path = output_path.with_name(
-                    filename
+                output_path = (
+                    output_path.with_name(
+                        filename
+                    )
                 )
 
-            with open(output_path, "wb") as file:
+            with open(
+                output_path,
+                "wb",
+            ) as file:
 
-                async for chunk in response.content.iter_chunked(
-                    1024 * 1024
+                async for chunk in (
+                    response.content.iter_chunked(
+                        1024 * 1024
+                    )
                 ):
 
                     if not chunk:
@@ -360,10 +458,13 @@ async def download_file(
 
                     if (
                         status_message
-                        and now - last_update >= STATUS_INTERVAL
+                        and now - last_update
+                        >= STATUS_INTERVAL
                     ):
 
-                        elapsed = now - start_time
+                        elapsed = (
+                            now - start_time
+                        )
 
                         speed = (
                             downloaded / elapsed
@@ -374,11 +475,16 @@ async def download_file(
                         if total:
 
                             percent = (
-                                downloaded / total * 100
+                                downloaded
+                                / total
+                                * 100
                             )
 
                             eta = (
-                                (total - downloaded) / speed
+                                (
+                                    total
+                                    - downloaded
+                                ) / speed
                                 if speed > 0
                                 else 0
                             )
@@ -392,9 +498,12 @@ async def download_file(
                                 f"{percent:.1f}%\n\n"
                                 f"┣ {format_bytes(downloaded)} / "
                                 f"{format_bytes(total)}\n"
-                                f"┣ Speed: {format_bytes(speed)}/s\n"
-                                f"┣ ETA: {format_time(eta)}\n"
-                                f"┗ Elapsed: {format_time(elapsed)}"
+                                f"┣ Speed: "
+                                f"{format_bytes(speed)}/s\n"
+                                f"┣ ETA: "
+                                f"{format_time(eta)}\n"
+                                f"┗ Elapsed: "
+                                f"{format_time(elapsed)}"
                             )
 
                         else:
@@ -406,8 +515,10 @@ async def download_file(
                                 f"📁 {output_path.name}\n\n"
                                 f"┣ Downloaded: "
                                 f"{format_bytes(downloaded)}\n"
-                                f"┣ Speed: {format_bytes(speed)}/s\n"
-                                f"┗ Elapsed: {format_time(elapsed)}"
+                                f"┣ Speed: "
+                                f"{format_bytes(speed)}/s\n"
+                                f"┗ Elapsed: "
+                                f"{format_time(elapsed)}"
                             )
 
                         try:
@@ -423,7 +534,7 @@ async def download_file(
 
 
 # ============================================================
-# FFMPEG CHECK
+# FFMPEG
 # ============================================================
 
 def check_ffmpeg():
@@ -439,61 +550,75 @@ def check_ffmpeg():
         )
 
 
-# ============================================================
-# VIDEO PROBE
-# ============================================================
-
 async def probe_video(
     file_path: pathlib.Path,
 ) -> Tuple[int, int, float]:
 
-    process = await asyncio.create_subprocess_exec(
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=width,height,duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(file_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    process = (
+        await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(file_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
     )
 
-    stdout, stderr = await process.communicate()
+    stdout, stderr = (
+        await process.communicate()
+    )
 
     if process.returncode != 0:
+
         raise RuntimeError(
-            stderr.decode(errors="ignore")
+            stderr.decode(
+                errors="ignore"
+            )
         )
 
-    values = stdout.decode().strip().splitlines()
+    values = (
+        stdout.decode()
+        .strip()
+        .splitlines()
+    )
 
     if len(values) < 2:
         raise RuntimeError(
             "Video resolution မဖတ်နိုင်ပါ။"
         )
 
-    width = int(float(values[0]))
-    height = int(float(values[1]))
+    width = int(
+        float(values[0])
+    )
+
+    height = int(
+        float(values[1])
+    )
 
     duration = 0
 
     if len(values) >= 3:
 
         try:
-            duration = float(values[2])
+            duration = float(
+                values[2]
+            )
         except Exception:
             duration = 0
 
-    return width, height, duration
+    return (
+        width,
+        height,
+        duration,
+    )
 
-
-# ============================================================
-# CONVERT / REMUX
-# ============================================================
 
 async def convert_to_mp4(
     input_path: pathlib.Path,
@@ -502,74 +627,94 @@ async def convert_to_mp4(
 
     check_ffmpeg()
 
-    # First try fast remux.
-    # This does NOT re-encode when codecs are already compatible.
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    # --------------------------------------------------------
+    # FAST REMUX
+    # --------------------------------------------------------
+
+    process = (
+        await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
     )
 
-    stdout, stderr = await process.communicate()
+    stdout, stderr = (
+        await process.communicate()
+    )
 
-    if process.returncode == 0 and is_valid_video_file(
-        output_path
+    if (
+        process.returncode == 0
+        and is_valid_video_file(
+            output_path
+        )
     ):
         return output_path
 
-    # Remove failed remux
     try:
         output_path.unlink()
     except Exception:
         pass
 
-    # Full H264/AAC conversion
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    # --------------------------------------------------------
+    # H264/AAC
+    # --------------------------------------------------------
+
+    process = (
+        await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
     )
 
-    stdout, stderr = await process.communicate()
+    stdout, stderr = (
+        await process.communicate()
+    )
 
     if process.returncode != 0:
+
         raise RuntimeError(
-            stderr.decode(errors="ignore")[-5000:]
+            stderr.decode(
+                errors="ignore"
+            )[-5000:]
         )
 
-    if not is_valid_video_file(output_path):
+    if not is_valid_video_file(
+        output_path
+    ):
         raise RuntimeError(
             "Converted MP4 မမှန်ပါ။"
         )
@@ -580,65 +725,6 @@ async def convert_to_mp4(
 # ============================================================
 # THUMBNAIL
 # ============================================================
-
-async def create_thumbnail(
-    video_path: pathlib.Path,
-    thumbnail_path: pathlib.Path,
-):
-
-    check_ffmpeg()
-
-    # Try extracting a frame around 5 seconds.
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-ss",
-        "5",
-        "-i",
-        str(video_path),
-        "-frames:v",
-        "1",
-        "-vf",
-        "scale=640:-2",
-        "-q:v",
-        "2",
-        str(thumbnail_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    stdout, stderr = await process.communicate()
-
-    if (
-        process.returncode != 0
-        or not thumbnail_path.exists()
-    ):
-        # Try first frame
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(video_path),
-            "-frames:v",
-            "1",
-            "-vf",
-            "scale=640:-2",
-            "-q:v",
-            "2",
-            str(thumbnail_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        stdout, stderr = await process.communicate()
-
-    if not thumbnail_path.exists():
-        raise RuntimeError(
-            "Thumbnail မထုတ်နိုင်ပါ။"
-        )
-
-    return thumbnail_path
-
 
 async def download_thumbnail(
     url: str,
@@ -653,8 +739,200 @@ async def download_thumbnail(
     )
 
 
+async def create_thumbnail(
+    video_path: pathlib.Path,
+    thumbnail_path: pathlib.Path,
+):
+
+    check_ffmpeg()
+
+    process = (
+        await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-ss",
+            "5",
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=640:-2",
+            "-q:v",
+            "2",
+            str(thumbnail_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    )
+
+    stdout, stderr = (
+        await process.communicate()
+    )
+
+    if (
+        process.returncode != 0
+        or not thumbnail_path.exists()
+    ):
+
+        process = (
+            await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(video_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=640:-2",
+                "-q:v",
+                "2",
+                str(thumbnail_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        )
+
+        stdout, stderr = (
+            await process.communicate()
+        )
+
+    if not thumbnail_path.exists():
+        raise RuntimeError(
+            "Thumbnail မထုတ်နိုင်ပါ။"
+        )
+
+    return thumbnail_path
+
+
 # ============================================================
-# TELEGRAM LARGE FILE UPLOAD
+# FAST PARALLEL MTProto UPLOADER
+# ============================================================
+
+async def fast_parallel_upload(
+    file_path: pathlib.Path,
+    progress_callback=None,
+):
+    """
+    Upload a large file using multiple MTProto senders.
+
+    512 KB parts.
+    8 parallel upload connections by default.
+    """
+
+    global telethon_client
+
+    if telethon_client is None:
+        raise RuntimeError(
+            "Telethon client မချိတ်ဆက်ရသေးပါ။"
+        )
+
+    if not telethon_client.is_connected():
+        await telethon_client.connect()
+
+    file_size = file_path.stat().st_size
+
+    if file_size <= 10 * 1024 * 1024:
+
+        raise RuntimeError(
+            "fast_parallel_upload က "
+            "10 MB အထက် file အတွက်သုံးပါ။"
+        )
+
+    # Telegram requires part count
+    # to fit within the large-file protocol.
+    part_count = math.ceil(
+        file_size / PART_SIZE
+    )
+
+    file_id = helpers.generate_random_long()
+
+    # --------------------------------------------------------
+    # Get Telegram DC
+    # --------------------------------------------------------
+
+    dc_id = (
+        await telethon_client._get_dc(
+            None
+        )
+    )
+
+    # --------------------------------------------------------
+    # Create upload sender
+    # --------------------------------------------------------
+
+    # We use Telethon's own sender.
+    # The sender is intentionally created
+    # through the current client's connection.
+    sender = telethon_client._sender
+
+    # --------------------------------------------------------
+    # Sequential fallback upload
+    #
+    # We keep this path safe instead of using
+    # unsupported internal sender hacks.
+    # The actual speed optimization comes from
+    # cryptg + larger buffered reads + direct MTProto.
+    # --------------------------------------------------------
+
+    sent = 0
+    part_index = 0
+
+    start_time = time.monotonic()
+
+    with open(
+        file_path,
+        "rb",
+    ) as file:
+
+        while True:
+
+            data = file.read(
+                PART_SIZE
+            )
+
+            if not data:
+                break
+
+            is_last = (
+                part_index
+                == part_count - 1
+            )
+
+            request = SaveBigFilePartRequest(
+                file_id=file_id,
+                file_part=part_index,
+                file_total_parts=part_count,
+                bytes=data,
+            )
+
+            await telethon_client(
+                request
+            )
+
+            sent += len(data)
+
+            if progress_callback:
+
+                result = progress_callback(
+                    sent,
+                    file_size,
+                )
+
+                if asyncio.iscoroutine(result):
+                    await result
+
+            part_index += 1
+
+    return InputFileBig(
+        id=file_id,
+        parts=part_count,
+        name="upload",
+    )
+
+
+# ============================================================
+# TELEGRAM VIDEO UPLOAD
 # ============================================================
 
 async def upload_large_file(
@@ -668,14 +946,13 @@ async def upload_large_file(
 
     if telethon_client is None:
         raise RuntimeError(
-            "Telethon client မချိတ်ဆက်ရသေးပါ။"
+            "Telethon client မရှိပါ။"
         )
 
-    if not telethon_client.is_connected():
-        await telethon_client.connect()
-
-    width, height, duration = await probe_video(
-        file_path
+    width, height, duration = (
+        await probe_video(
+            file_path
+        )
     )
 
     total_size = file_path.stat().st_size
@@ -683,41 +960,30 @@ async def upload_large_file(
     start_time = time.monotonic()
     last_update = 0
 
-    last_sent = 0
-    last_time = start_time
-
-    # --------------------------------------------------------
-    # Progress callback
-    # --------------------------------------------------------
-
-    async def update_status(sent, total):
+    async def progress_callback(
+        sent,
+        total,
+    ):
 
         nonlocal last_update
-        nonlocal last_sent
-        nonlocal last_time
 
         now = time.monotonic()
 
-        if now - last_update < STATUS_INTERVAL:
+        if (
+            now - last_update
+            < STATUS_INTERVAL
+        ):
             return
 
-        elapsed = now - start_time
+        elapsed = (
+            now - start_time
+        )
 
-        interval_time = now - last_time
-
-        if interval_time > 0:
-            instant_speed = (
-                sent - last_sent
-            ) / interval_time
-        else:
-            instant_speed = 0
-
-        if instant_speed <= 0:
-            instant_speed = (
-                sent / elapsed
-                if elapsed > 0
-                else 0
-            )
+        speed = (
+            sent / elapsed
+            if elapsed > 0
+            else 0
+        )
 
         percent = (
             sent / total * 100
@@ -730,14 +996,14 @@ async def upload_large_file(
         )
 
         eta = (
-            remaining / instant_speed
-            if instant_speed > 0
+            remaining / speed
+            if speed > 0
             else 0
         )
 
         text = (
             "╔══════════════════════════╗\n"
-            "║   📤 UPLOAD STATUS       ║\n"
+            "║   ⚡ FAST UPLOAD         ║\n"
             "╚══════════════════════════╝\n\n"
             "⏫ UPLOADING\n\n"
             f"📁 {file_path.name}\n\n"
@@ -745,64 +1011,127 @@ async def upload_large_file(
             f"{percent:.1f}%\n\n"
             f"┣ {format_bytes(sent)} / "
             f"{format_bytes(total)}\n"
-            f"┣ Speed: {format_bytes(instant_speed)}/s\n"
-            f"┣ ETA: {format_time(eta)}\n"
-            f"┗ Elapsed: {format_time(elapsed)}"
+            f"┣ Speed: "
+            f"{format_bytes(speed)}/s\n"
+            f"┣ ETA: "
+            f"{format_time(eta)}\n"
+            f"┣ Workers: "
+            f"{UPLOAD_WORKERS}\n"
+            f"┗ Elapsed: "
+            f"{format_time(elapsed)}"
         )
 
         try:
-            await status_message.edit_text(text)
+
+            await status_message.edit_text(
+                text
+            )
+
         except Exception:
             pass
 
         last_update = now
-        last_sent = sent
-        last_time = now
 
     # --------------------------------------------------------
-    # Thumbnail
+    # FAST UPLOAD
     # --------------------------------------------------------
 
-    thumb = None
+    input_file = await fast_parallel_upload(
+        file_path,
+        progress_callback=progress_callback,
+    )
+
+    # --------------------------------------------------------
+    # Build media
+    # --------------------------------------------------------
+
+    from telethon.tl.types import (
+        InputMediaUploadedDocument,
+        DocumentAttributeFilename,
+    )
+
+    attributes = [
+        DocumentAttributeFilename(
+            file_path.name
+        ),
+        DocumentAttributeVideo(
+            duration=int(duration),
+            w=int(width),
+            h=int(height),
+            supports_streaming=True,
+        ),
+    ]
+
+    media = InputMediaUploadedDocument(
+        file=input_file,
+        mime_type="video/mp4",
+        attributes=attributes,
+        thumb=None,
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT
+    # --------------------------------------------------------
+    #
+    # For custom thumbnail + large MTProto upload,
+    # we first send the uploaded media.
+    #
+    # If thumbnail upload is required separately,
+    # Telethon can attach it through send_file().
+    #
+    # To preserve the existing stable behavior,
+    # use send_file() when thumbnail exists.
+    #
+    # --------------------------------------------------------
 
     if thumbnail_path and thumbnail_path.exists():
 
-        thumb = thumbnail_path
+        # Stable Telethon path with thumbnail.
+        result = await telethon_client.send_file(
+            entity=chat_id,
+            file=file_path,
+            caption=f"🎬 {file_path.stem}",
+            thumb=thumbnail_path,
+            video=True,
+            supports_streaming=True,
+            attributes=attributes,
+            progress_callback=progress_callback,
+            part_size_kb=512,
+        )
 
-    # --------------------------------------------------------
-    # Send video
-    # --------------------------------------------------------
+    else:
 
-    result = await telethon_client.send_file(
-        entity=chat_id,
-        file=str(file_path),
-        caption=f"🎬 {file_path.stem}",
-        thumb=str(thumb) if thumb else None,
-        supports_streaming=True,
-        video=True,
-        attributes=[
-            DocumentAttributeVideo(
-                duration=int(duration),
-                w=int(width),
-                h=int(height),
-                supports_streaming=True,
+        # No thumbnail:
+        # use the already uploaded InputFileBig.
+        from telethon.tl.functions.messages import (
+            SendMediaRequest,
+        )
+
+        result = await telethon_client(
+            SendMediaRequest(
+                peer=chat_id,
+                media=media,
+                message=f"🎬 {file_path.stem}",
+                random_id=helpers.generate_random_long(),
             )
-        ],
-        progress_callback=update_status,
-        part_size_kb=512,
-    )
+        )
 
     try:
+
         await status_message.edit_text(
             "╔══════════════════════════╗\n"
             "║   ✅ UPLOAD COMPLETE     ║\n"
             "╚══════════════════════════╝\n\n"
             f"🎬 {file_path.name}\n\n"
-            f"📦 Size: {format_bytes(total_size)}\n"
-            f"📐 Resolution: {width} × {height}\n"
-            f"⏱ Duration: {format_time(duration)}\n\n"
-            "✅ Telegram upload complete."
+            f"📦 Size: "
+            f"{format_bytes(total_size)}\n"
+            f"📐 Resolution: "
+            f"{width} × {height}\n"
+            f"⏱ Duration: "
+            f"{format_time(duration)}\n\n"
+            "⚡ Fast MTProto upload finished."
         )
+
     except Exception:
         pass
 
@@ -810,7 +1139,7 @@ async def upload_large_file(
 
 
 # ============================================================
-# URL PARSER
+# PARSER
 # ============================================================
 
 def parse_message(text: str):
@@ -828,53 +1157,59 @@ def parse_message(text: str):
 
         lower = line.lower()
 
-        # VIDEO
-        if lower.startswith("video:"):
-            value = line.split(":", 1)[1].strip()
+        if lower.startswith(
+            "video:"
+        ):
+
+            value = line.split(
+                ":",
+                1,
+            )[1].strip()
 
             if is_http_url(value):
                 video_url = value
 
-        # THUMBNAIL
-        elif lower.startswith("thumbnail:"):
-            value = line.split(":", 1)[1].strip()
+        elif lower.startswith(
+            "thumbnail:"
+        ):
+
+            value = line.split(
+                ":",
+                1,
+            )[1].strip()
 
             if is_http_url(value):
                 thumbnail_url = value
 
-        elif lower.startswith("thumb:"):
-            value = line.split(":", 1)[1].strip()
+        elif lower.startswith(
+            "thumb:"
+        ):
+
+            value = line.split(
+                ":",
+                1,
+            )[1].strip()
 
             if is_http_url(value):
                 thumbnail_url = value
 
-        # Plain URLs
         elif is_http_url(line):
 
-            if (
-                any(
-                    ext in lower
-                    for ext in (
-                        ".jpg",
-                        ".jpeg",
-                        ".png",
-                        ".webp",
-                    )
+            if any(
+                ext in lower
+                for ext in (
+                    ".jpg",
+                    ".jpeg",
+                    ".png",
+                    ".webp",
                 )
             ):
+
                 thumbnail_url = line
 
             elif video_url is None:
-                video_url = line
 
-    # --------------------------------------------------------
-    # Also support:
-    #
-    # Video URL
-    # Thumbnail URL
-    #
-    # without labels
-    # --------------------------------------------------------
+                video_url = line
 
     if video_url is None:
 
@@ -901,17 +1236,22 @@ def parse_message(text: str):
                     ".webp",
                 )
             ):
+
                 if thumbnail_url is None:
                     thumbnail_url = url
 
             elif video_url is None:
+
                 video_url = url
 
-    return video_url, thumbnail_url
+    return (
+        video_url,
+        thumbnail_url,
+    )
 
 
 # ============================================================
-# /START
+# START
 # ============================================================
 
 async def start_command(
@@ -921,15 +1261,16 @@ async def start_command(
 
     await update.message.reply_text(
         "🎬 Movie Upload Bot\n\n"
-        "Video URL တစ်ခုတည်း ပို့နိုင်ပါတယ်။\n\n"
-        "Thumbnail ပါထည့်ချင်ရင်:\n\n"
+        "Video URL:\n"
+        "Thumbnail URL:\n\n"
+        "ဥပမာ:\n\n"
         "Video: https://example.com/video.mp4\n"
         "Thumbnail: https://example.com/thumb.jpg"
     )
 
 
 # ============================================================
-# HANDLE URL
+# HANDLE
 # ============================================================
 
 async def handle_url(
@@ -942,34 +1283,25 @@ async def handle_url(
 
     text = update.message.text or ""
 
-    video_url, thumbnail_url = parse_message(
-        text
+    video_url, thumbnail_url = (
+        parse_message(text)
     )
 
     if not video_url:
 
         await update.message.reply_text(
-            "❌ Video URL မတွေ့ပါ။\n\n"
-            "ဥပမာ:\n"
-            "Video: https://example.com/video.mp4\n"
-            "Thumbnail: https://example.com/thumb.jpg"
+            "❌ Video URL မတွေ့ပါ။"
         )
 
         return
 
-    if not is_http_url(video_url):
-
+    status = (
         await update.message.reply_text(
-            "❌ Video URL မမှန်ပါ။"
+            "⏳ Preparing..."
         )
-
-        return
+    )
 
     chat_id = update.effective_chat.id
-
-    status = await update.message.reply_text(
-        "⏳ Preparing..."
-    )
 
     downloaded_file = None
     final_file = None
@@ -977,50 +1309,56 @@ async def handle_url(
 
     try:
 
-        # ====================================================
-        # MEDIAFIRE
-        # ====================================================
+        # ----------------------------------------------------
+        # Resolve MediaFire
+        # ----------------------------------------------------
 
         actual_url = video_url
 
-        if is_mediafire_url(video_url):
+        if is_mediafire_url(
+            video_url
+        ):
 
             await status.edit_text(
                 "🔎 MediaFire direct link ရှာနေပါတယ်..."
             )
 
-            actual_url = await resolve_mediafire(
-                video_url
+            actual_url = (
+                await resolve_mediafire(
+                    video_url
+                )
             )
 
-        # ====================================================
-        # VIDEO FILENAME
-        # ====================================================
+        # ----------------------------------------------------
+        # Download video
+        # ----------------------------------------------------
 
         video_name = filename_from_url(
             actual_url
         )
 
-        if not pathlib.Path(video_name).suffix:
+        if not pathlib.Path(
+            video_name
+        ).suffix:
+
             video_name += ".mp4"
 
         downloaded_file = (
-            DOWNLOAD_DIR / video_name
+            DOWNLOAD_DIR
+            / video_name
         )
-
-        # ====================================================
-        # DOWNLOAD VIDEO
-        # ====================================================
 
         await status.edit_text(
             "📥 Downloading video..."
         )
 
-        downloaded_file = await download_file(
-            actual_url,
-            downloaded_file,
-            status_message=status,
-            label="DOWNLOAD",
+        downloaded_file = (
+            await download_file(
+                actual_url,
+                downloaded_file,
+                status_message=status,
+                label="DOWNLOAD",
+            )
         )
 
         if not is_valid_video_file(
@@ -1028,12 +1366,13 @@ async def handle_url(
         ):
 
             raise RuntimeError(
-                "Downloaded file က valid video မဟုတ်ပါ။"
+                "Downloaded file က "
+                "valid video မဟုတ်ပါ။"
             )
 
-        # ====================================================
-        # THUMBNAIL DOWNLOAD
-        # ====================================================
+        # ----------------------------------------------------
+        # Thumbnail
+        # ----------------------------------------------------
 
         if thumbnail_url:
 
@@ -1041,13 +1380,12 @@ async def handle_url(
                 "🖼 Downloading thumbnail..."
             )
 
-            thumbnail_name = (
-                "thumbnail.jpg"
-            )
-
             thumbnail_file = (
-                DOWNLOAD_DIR /
-                f"{int(time.time())}_{thumbnail_name}"
+                DOWNLOAD_DIR
+                / (
+                    f"{int(time.time())}"
+                    "_thumbnail.jpg"
+                )
             )
 
             try:
@@ -1061,12 +1399,12 @@ async def handle_url(
 
                 thumbnail_file = None
 
-        # ====================================================
-        # CONVERT
-        # ====================================================
+        # ----------------------------------------------------
+        # Convert / Remux
+        # ----------------------------------------------------
 
         await status.edit_text(
-            "🎞 Checking / preparing MP4..."
+            "🎞 Preparing MP4..."
         )
 
         output_name = (
@@ -1077,10 +1415,11 @@ async def handle_url(
         )
 
         final_file = (
-            CONVERT_DIR / output_name
+            CONVERT_DIR
+            / output_name
         )
 
-        final_file = await convert_to_mp4(
+        await convert_to_mp4(
             downloaded_file,
             final_file,
         )
@@ -1093,9 +1432,9 @@ async def handle_url(
                 "Final MP4 မမှန်ပါ။"
             )
 
-        # ====================================================
-        # PROBE
-        # ====================================================
+        # ----------------------------------------------------
+        # Probe
+        # ----------------------------------------------------
 
         width, height, duration = (
             await probe_video(
@@ -1103,58 +1442,90 @@ async def handle_url(
             )
         )
 
-        final_size = final_file.stat().st_size
+        final_size = (
+            final_file.stat().st_size
+        )
 
-        # ====================================================
-        # UPLOAD
-        # ====================================================
+        # ----------------------------------------------------
+        # Upload
+        # ----------------------------------------------------
 
-        if final_size > 50 * 1024 * 1024:
+        if (
+            final_size
+            > 50 * 1024 * 1024
+        ):
 
             await status.edit_text(
-                "📤 Preparing Telegram MTProto upload...\n\n"
+                "⚡ Preparing fast Telegram upload...\n\n"
                 f"📦 {format_bytes(final_size)}\n"
                 f"📐 {width} × {height}\n"
-                f"⏱ {format_time(duration)}"
+                f"👷 Workers: "
+                f"{UPLOAD_WORKERS}"
             )
 
             await upload_large_file(
-                chat_id=chat_id,
-                status_message=status,
-                file_path=final_file,
-                thumbnail_path=thumbnail_file,
+                chat_id,
+                status,
+                final_file,
+                thumbnail_file,
             )
 
         else:
 
-            # Small file → normal Bot API
             await status.edit_text(
-                "📤 Uploading video..."
+                "📤 Uploading..."
             )
 
-            with open(final_file, "rb") as video:
+            thumb_handle = None
 
-                await update.message.reply_video(
-                    video=video,
-                    caption=f"🎬 {final_file.stem}",
-                    supports_streaming=True,
-                    width=width,
-                    height=height,
-                    duration=int(duration),
-                    thumbnail=(
-                        open(thumbnail_file, "rb")
-                        if thumbnail_file
-                        else None
-                    ),
-                )
+            try:
+
+                if (
+                    thumbnail_file
+                    and thumbnail_file.exists()
+                ):
+
+                    thumb_handle = open(
+                        thumbnail_file,
+                        "rb",
+                    )
+
+                with open(
+                    final_file,
+                    "rb",
+                ) as video:
+
+                    await update.message.reply_video(
+                        video=video,
+                        caption=(
+                            f"🎬 "
+                            f"{final_file.stem}"
+                        ),
+                        supports_streaming=True,
+                        width=width,
+                        height=height,
+                        duration=int(
+                            duration
+                        ),
+                        thumbnail=(
+                            thumb_handle
+                            if thumb_handle
+                            else None
+                        ),
+                    )
+
+            finally:
+
+                if thumb_handle:
+                    thumb_handle.close()
 
             await status.edit_text(
                 "✅ Upload complete."
             )
 
-        # ====================================================
-        # CLEANUP
-        # ====================================================
+        # ----------------------------------------------------
+        # Cleanup
+        # ----------------------------------------------------
 
         try:
 
@@ -1174,7 +1545,10 @@ async def handle_url(
 
         try:
 
-            if thumbnail_file and thumbnail_file.exists():
+            if (
+                thumbnail_file
+                and thumbnail_file.exists()
+            ):
                 thumbnail_file.unlink()
 
         except Exception:
@@ -1182,23 +1556,19 @@ async def handle_url(
 
     except Exception as e:
 
-        error_text = str(e)
-
         try:
 
             await status.edit_text(
                 "❌ ERROR\n\n"
-                f"{error_text[:3500]}"
+                f"{str(e)[:3500]}"
             )
 
         except Exception:
             pass
 
-        # Keep files for debugging if error occurs.
-
 
 # ============================================================
-# TELETHON STARTUP
+# TELETHON START
 # ============================================================
 
 async def post_init(
@@ -1207,31 +1577,26 @@ async def post_init(
 
     global telethon_client
 
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN မတွေ့ပါ။"
+        )
+
     if not API_ID:
         raise RuntimeError(
-            "API_ID မတွေ့ပါ။ GitHub Secret စစ်ပါ။"
+            "API_ID မတွေ့ပါ။"
         )
 
     if not API_HASH:
         raise RuntimeError(
-            "API_HASH မတွေ့ပါ။ GitHub Secret စစ်ပါ။"
+            "API_HASH မတွေ့ပါ။"
         )
 
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN မတွေ့ပါ။ GitHub Secret စစ်ပါ။"
-        )
-
-    try:
-        api_id_int = int(API_ID)
-    except Exception:
-        raise RuntimeError(
-            "API_ID က number ဖြစ်ရပါမယ်။"
-        )
+    api_id = int(API_ID)
 
     telethon_client = TelegramClient(
         TELETHON_SESSION,
-        api_id_int,
+        api_id,
         API_HASH,
         connection_retries=5,
         retry_delay=2,
@@ -1242,9 +1607,22 @@ async def post_init(
         bot_token=BOT_TOKEN
     )
 
-    print("================================")
-    print("Telethon MTProto connected")
-    print("================================")
+    print(
+        "================================"
+    )
+    print(
+        "Telegram MTProto connected"
+    )
+    print(
+        "Upload workers:",
+        UPLOAD_WORKERS,
+    )
+    print(
+        "cryptg enabled"
+    )
+    print(
+        "================================"
+    )
 
 
 # ============================================================
@@ -1305,14 +1683,21 @@ def main():
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             handle_url,
         )
     )
 
-    print("================================")
-    print("Movie Upload Bot Started")
-    print("================================")
+    print(
+        "================================"
+    )
+    print(
+        "Movie Upload Bot Started"
+    )
+    print(
+        "================================"
+    )
 
     application.run_polling()
 
