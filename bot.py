@@ -652,7 +652,7 @@ async def convert_to_mp4(
 
         try:
 
-            await status_message.edit(
+            await status_message.edit_text(
                 "🔄 <b>Preparing MP4...</b>",
                 parse_mode="HTML",
             )
@@ -716,7 +716,7 @@ async def convert_to_mp4(
 
         try:
 
-            await status_message.edit(
+            await status_message.edit_text(
                 "🎞️ <b>Converting to MP4...</b>\n\n"
                 "Please wait...",
                 parse_mode="HTML",
@@ -988,7 +988,7 @@ async def download_file(
     start_time = time.monotonic()
 
     downloaded = 0
-    last_update = -STATUS_INTERVAL
+    last_update = 0
 
     async with aiohttp.ClientSession(
         timeout=timeout,
@@ -1101,7 +1101,7 @@ async def download_file(
 
                         try:
 
-                            await status_message.edit(
+                            await status_message.edit_text(
                                 text,
                                 parse_mode="HTML",
                             )
@@ -1483,7 +1483,7 @@ async def send_large_video(
             last = getattr(
                 progress_callback,
                 "_last",
-                -STATUS_INTERVAL,
+                0,
             )
 
             if (
@@ -1494,7 +1494,7 @@ async def send_large_video(
 
                 try:
 
-                    await status_message.edit(
+                    await status_message.edit_text(
                         "⬆️ <b>Uploading to Telegram...</b>\n\n"
                         f"{progress_bar(percent)} "
                         f"{percent:.1f}%\n\n"
@@ -1860,22 +1860,6 @@ async def process_queue_item(
 
         raise
 
-    # Make sure the download status reaches exactly 100%.
-    try:
-        elapsed = max(time.monotonic() - start_time, 0.001)
-        downloaded_size = result.get("size", 0)
-        await status.edit(
-            "⬇️ <b>Downloading...</b>\n\n"
-            f"{progress_bar(100)} 100.0%\n\n"
-            f"📦 {format_bytes(downloaded_size)} / {format_bytes(downloaded_size)}\n"
-            f"⚡ {format_bytes(downloaded_size / elapsed)}/s\n"
-            f"⏱ {format_time(elapsed)}\n"
-            "🕐 ETA 00:00",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-
     header_filename = (
         result.get(
             "header_filename"
@@ -2110,7 +2094,7 @@ async def process_queue_item(
         )
 
         upload_start_time = time.monotonic()
-        upload_last_update = -STATUS_INTERVAL
+        upload_last_update = 0
         upload_last_task = None
 
         def small_upload_progress(sent, total):
@@ -2159,7 +2143,7 @@ async def process_queue_item(
 
             async def update_status():
                 try:
-                    await status.edit(
+                    await status.edit_text(
                         text,
                         parse_mode="HTML",
                     )
@@ -2208,7 +2192,7 @@ async def process_queue_item(
                     pass
 
             try:
-                await status.edit(
+                await status.edit_text(
                     "⬆️ <b>Uploading to Telegram...</b>\n\n"
                     f"{progress_bar(100)} 100.0%\n\n"
                     f"📦 {format_bytes(file_size)} / "
@@ -2329,11 +2313,16 @@ async def start_command(
 
     await update.message.reply_text(
         "🎬 <b>Movie Upload Bot</b>\n\n"
-        "Send one or multiple video URLs .\n\n"
+        "Send one or multiple video URLs.\n\n"
         "<b>Example:</b>\n\n"
         "<code>Video: https://site.com/a.mp4\n"
-        "Thumbnail: https://site.com/a.jpg</code>\n\n"
-        "Commands:\n",
+        "Thumbnail: https://site.com/a.jpg\n\n"
+        "Video: https://site.com/b.mp4\n"
+        "Thumbnail: https://site.com/b.jpg</code>\n\n"
+        "Commands:\n"
+        "/queue - Queue ကြည့်ရန်\n"
+        "/clear - Waiting queue ရှင်းရန်\n"
+        "/cancel - လက်ရှိအလုပ် Cancel",
         parse_mode="HTML",
     )
 
@@ -2406,7 +2395,7 @@ async def cancel_command(
     if not current_item:
 
         await update.message.reply_text(
-            "⛔ လက်ရှိ processing လုပ်နေတဲ့ item မရှိပါဘူး။"
+            "ℹ️ လက်ရှိ processing လုပ်နေတဲ့ item မရှိပါဘူး။"
         )
 
         return
