@@ -2093,70 +2093,6 @@ async def process_queue_item(
             "rb",
         )
 
-        upload_start_time = time.monotonic()
-        upload_last_update = 0
-        upload_last_task = None
-
-        def small_upload_progress(sent, total):
-
-            nonlocal upload_last_update, upload_last_task
-
-            now = time.monotonic()
-
-            if (
-                now - upload_last_update < STATUS_INTERVAL
-                and sent < total
-            ):
-                return
-
-            upload_last_update = now
-
-            elapsed = now - upload_start_time
-            speed = (
-                sent / elapsed
-                if elapsed > 0
-                else 0
-            )
-
-            percent = (
-                sent / total * 100
-                if total > 0
-                else 0
-            )
-
-            eta = (
-                (total - sent) / speed
-                if speed > 0
-                else 0
-            )
-
-            text = (
-                "⬆️ <b>Uploading to Telegram...</b>\n\n"
-                f"{progress_bar(percent)} "
-                f"{percent:.1f}%\n\n"
-                f"📦 {format_bytes(sent)} / "
-                f"{format_bytes(total)}\n"
-                f"⚡ {format_bytes(speed)}/s\n"
-                f"⏱ {format_time(elapsed)}\n"
-                f"🕐 ETA {format_time(eta)}"
-            )
-
-            async def update_status():
-                try:
-                    await status.edit_text(
-                        text,
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-
-            try:
-                upload_last_task = asyncio.create_task(
-                    update_status()
-                )
-            except Exception:
-                upload_last_task = None
-
         thumb_file = None
 
         try:
@@ -2181,29 +2117,7 @@ async def process_queue_item(
                 parse_mode="HTML",
                 supports_streaming=True,
                 thumb=thumb_file,
-                progress_callback=small_upload_progress,
             )
-
-            # Make sure the status reaches exactly 100% before success.
-            if upload_last_task:
-                try:
-                    await upload_last_task
-                except Exception:
-                    pass
-
-            try:
-                await status.edit_text(
-                    "⬆️ <b>Uploading to Telegram...</b>\n\n"
-                    f"{progress_bar(100)} 100.0%\n\n"
-                    f"📦 {format_bytes(file_size)} / "
-                    f"{format_bytes(file_size)}\n"
-                    f"⚡ {format_bytes(file_size / max(time.monotonic() - upload_start_time, 0.001))}/s\n"
-                    f"⏱ {format_time(time.monotonic() - upload_start_time)}\n"
-                    f"🕐 ETA 00:00",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
 
         finally:
 
