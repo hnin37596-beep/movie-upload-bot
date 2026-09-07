@@ -969,14 +969,20 @@ async def download_file(
     cancel_event=None,
 ):
 
+    # Browser-like media request for direct video hosts.
+    # Keep the Authorization query string exactly as supplied.
     headers = {
         "User-Agent": (
             "Mozilla/5.0 "
             "(Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 "
-            "Chrome/131.0 Safari/537.36"
+            "(KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
         ),
         "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive",
+        "Range": "bytes=0-",
     }
 
     timeout = aiohttp.ClientTimeout(
@@ -1000,7 +1006,29 @@ async def download_file(
             allow_redirects=True,
         ) as response:
 
-            response.raise_for_status()
+            # Accept both a normal full response (200) and a
+            # browser-style partial response (206).
+            if response.status not in (200, 206):
+                try:
+                    error_body = await response.text(
+                        errors="ignore"
+                    )
+                except Exception:
+                    error_body = ""
+
+                error_body = " ".join(
+                    error_body.split()
+                )[:500]
+
+                raise RuntimeError(
+                    f"Download HTTP {response.status} "
+                    f"({response.reason})."
+                    + (
+                        f"\\nServer response: {error_body}"
+                        if error_body
+                        else ""
+                    )
+                )
 
             total = int(
                 response.headers.get(
@@ -1008,6 +1036,21 @@ async def download_file(
                     0,
                 )
             )
+
+            # For HTTP 206, Content-Length can be only the returned
+            # range length. Content-Range contains the full file size.
+            content_range = response.headers.get(
+                "Content-Range",
+                ""
+            )
+
+            range_match = re.search(
+                r"/(\\d+)$",
+                content_range
+            )
+
+            if range_match:
+                total = int(range_match.group(1))
 
             header_name = (
                 get_filename_from_headers(
@@ -2700,3 +2743,4 @@ if __name__ == "__main__":
     asyncio.run(
         main()
     )
+    
