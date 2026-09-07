@@ -6,6 +6,7 @@ import asyncio
 import shutil
 from pathlib import Path
 from urllib.parse import urlparse, unquote
+from yarl import URL
 from dataclasses import dataclass
 
 import aiohttp
@@ -1001,8 +1002,16 @@ async def download_file(
         headers=headers,
     ) as session:
 
+        # IMPORTANT:
+        # aiohttp/yarl normally normalizes/re-quotes URL strings.
+        # Some signed video hosts reject that normalization and return:
+        # "Bad character in percent-encoded string".
+        # Send the original URL as an already-encoded URL so every
+        # %XX sequence (including %20 and %2C) is preserved exactly.
+        request_url = URL(url, encoded=True)
+
         async with session.get(
-            url,
+            request_url,
             allow_redirects=True,
         ) as response:
 
@@ -2743,4 +2752,3 @@ if __name__ == "__main__":
     asyncio.run(
         main()
     )
-    
